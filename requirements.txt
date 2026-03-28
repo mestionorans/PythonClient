@@ -1,0 +1,5 @@
+# Runtime dependencies (kept in sync with [project.dependencies] in pyproject.toml).
+# Install the package: pip install -e .
+# Or install deps only: pip install -r requirements.txt
+cryptography>=42.0.0
+pytest>=7.0

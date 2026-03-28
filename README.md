@@ -1,30 +1,30 @@
 # PythonClient
 
-Vertex client for the Library of Mestionora backup network (I2P layer to be wired in).
+Vertex client per the in-repo design doc: **JSON** snapshot persistence (`vertex_state.json`), **`permanent/` / `emergency/` / `non_permanent/`** quotas from **config**, **I2P** stubs (`grab_file`, `host_file`, `check_neighbor`, `broadcast`, …).
 
-## Layout
+## Setup
 
-```text
-PythonClient/
-  pyproject.toml          # setuptools, package `vertex` under src/
-  src/vertex/
-    __init__.py           # VertexClient, I2P
-    client.py             # VertexClient (policy / orchestration)
-    i2p.py                # I2P — fetch/seed/neighbor hooks
-```
+Dependencies are declared in **`pyproject.toml`** (runtime: `cryptography`; dev optional: `pytest`). **`requirements.txt`** mirrors runtime deps for plain `pip install -r` workflows.
 
-## Install
-
-From the repo root (requires a Python environment with `pip`):
+**Anywhere with Python 3.10+ and pip:**
 
 ```bash
-pip install -e .
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"     # editable install + dev deps
+# or: pip install -r requirements-dev.txt && pip install -e .
 ```
 
-Then: `from vertex import VertexClient, I2P`.
+**Nix:** use either `nix develop` (Flakes; run `nix flake lock` once if `flake.lock` is missing) or `nix-shell` (uses `shell.nix`). Both provide Python and pip; then create a venv and `pip install -e ".[dev]"` as above.
 
-For a quick check without installing, use `PYTHONPATH=src`.
+```python
+from pathlib import Path
+from vertex import VertexClient, VertexConfig
 
-## I2P vs `VertexClient`
+c = VertexClient(Path.home() / ".vertex")
+# c.save_config(VertexConfig(...))
+# c.on_launch_or_daily()
+# c.close()
+```
 
-`I2P` holds fetch/seed/neighbor hooks. Pass `VertexClient(i2p=...)` if you need a shared or test instance; otherwise the client constructs a default `I2P`.
+Scheduling (e.g. “every hour” `check_neighbors` + `broadcast_at_risk`) is **out of scope**—call those methods from your own runner.

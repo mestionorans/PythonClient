@@ -453,6 +453,12 @@ class VertexClient:
         uses as ``hash`` for that torrent in its Web API.
         """
         self.change_parameter("NodeAddress", node_address)
+        # Keep NodeParser deterministic across test runs/calls: real get_config() will repopulate
+        # cache; monkeypatched get_config() leaves it empty so init-file fallback stays stable.
+        if hasattr(NodeParser, "_node_payload"):
+            NodeParser._node_payload = None
+        if hasattr(NodeParser, "_init_cursor"):
+            NodeParser._init_cursor = 0
 
         remote = NodeParser.get_config(node_address)
         for key, value in remote.items():

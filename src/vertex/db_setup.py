@@ -1,8 +1,9 @@
 """
 SQLite helpers for the Vertex client: schema init, config persistence, storage, neighbors, unhealth.
 
-The ``storage`` table holds ``id``, ``file_location``, ``metadata``, and ``priority`` (integer; higher
-values sort first in ``storage_list``).
+The ``storage`` table uses ``id TEXT PRIMARY KEY``: the torrent / download file id (same id passed to
+I2P). Columns: ``file_location`` (tier path under the data root), ``metadata``, ``size`` (bytes),
+``priority`` (integer; higher values sort first in ``storage_list``).
 """
 
 from __future__ import annotations
@@ -22,7 +23,9 @@ __all__ = [
     "storage_get",
     "storage_list",
     "storage_delete",
+    "storage_update_metadata",
     "storage_update_priority",
+    "storage_update_size",
     "neighbor_upsert",
     "neighbor_get",
     "neighbors_list",
@@ -52,10 +55,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS storage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT PRIMARY KEY,
             file_location TEXT NOT NULL,
             metadata TEXT,
-            priority INTEGER NOT NULL DEFAULT 0
+            priority INTEGER NOT NULL DEFAULT 0,
+            size INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS neighbors (
@@ -70,18 +74,6 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    _migrate_storage_priority(conn)
-
-
-def _migrate_storage_priority(conn: sqlite3.Connection) -> None:
-    """Add ``priority`` to ``storage`` when opening DBs created before that column existed."""
-    rows = conn.execute("PRAGMA table_info(storage)").fetchall()
-    if not rows:
-        return
-    names = {str(r["name"]) for r in rows}
-    if "priority" in names:
-        return
-    conn.execute("ALTER TABLE storage ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
 
 def _json_dumps(value: Any) -> str:
@@ -127,25 +119,29 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any) -> None:
     )
 
 
-# --- storage ---
+# --- storage: id = torrent / download file id (TEXT) ---
 
 
 def storage_insert(
     conn: sqlite3.Connection,
+    torrent_id: str,
     file_location: str,
     metadata: str | None,
     *,
     priority: int = 0,
-) -> int:
-    cur = conn.execute(
-        "INSERT INTO storage(file_location, metadata, priority) VALUES(?, ?, ?)",
-        (file_location, metadata, priority),
+    size: int = 0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO storage(id, file_location, metadata, priority, size)
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (torrent_id, file_location, metadata, priority, size),
     )
-    return int(cur.lastrowid)
 
 
-def storage_get(conn: sqlite3.Connection, row_id: int) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM storage WHERE id = ?", (row_id,)).fetchone()
+def storage_get(conn: sqlite3.Connection, torrent_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM storage WHERE id = ?", (torrent_id,)).fetchone()
     if row is None:
         return None
     return dict(row)
@@ -158,15 +154,31 @@ def storage_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
-def storage_update_priority(conn: sqlite3.Connection, row_id: int, priority: int) -> None:
+def storage_update_metadata(
+    conn: sqlite3.Connection, torrent_id: str, metadata: str | None
+) -> None:
     conn.execute(
-        "UPDATE storage SET priority = ? WHERE id = ?",
-        (priority, row_id),
+        "UPDATE storage SET metadata = ? WHERE id = ?",
+        (metadata, torrent_id),
     )
 
 
-def storage_delete(conn: sqlite3.Connection, row_id: int) -> None:
-    conn.execute("DELETE FROM storage WHERE id = ?", (row_id,))
+def storage_update_priority(conn: sqlite3.Connection, torrent_id: str, priority: int) -> None:
+    conn.execute(
+        "UPDATE storage SET priority = ? WHERE id = ?",
+        (priority, torrent_id),
+    )
+
+
+def storage_update_size(conn: sqlite3.Connection, torrent_id: str, size: int) -> None:
+    conn.execute(
+        "UPDATE storage SET size = ? WHERE id = ?",
+        (size, torrent_id),
+    )
+
+
+def storage_delete(conn: sqlite3.Connection, torrent_id: str) -> None:
+    conn.execute("DELETE FROM storage WHERE id = ?", (torrent_id,))
 
 
 # --- neighbors: trust 1 = trusted, -1 = banned, 0 = pending ---
@@ -223,7 +235,7 @@ def neighbor_increment_times(conn: sqlite3.Connection, public_key: str) -> int:
     return int(row["times_found"]) if row else 0
 
 
-# --- unhealth: id + size ---
+# --- unhealth: id = same torrent id as storage ---
 
 
 def unhealth_upsert(conn: sqlite3.Connection, id_: str, size: int) -> None:

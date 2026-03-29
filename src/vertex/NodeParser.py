@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["get_config", "get_init_files"]
+__all__ = ["get_config", "get_init_files", "fetch_metadata"]
 
 
 def get_config(node_address: str) -> dict[str, Any]:
@@ -14,10 +14,12 @@ def get_config(node_address: str) -> dict[str, Any]:
     Return tunables advertised by the node at ``node_address``.
 
     **Stub:** Ignores ``node_address`` and returns defaults shaped like :data:`vertex.client.DEFAULT_CONFIG`
-    keys (percents, swappiness, trust, trackers).
+    keys (percents, swappiness, trust, trackers, unhealth index, priority weights).
 
     Expected real fields: ``Health_Ind_Storage_Perc``, ``Emergency_Storage_Perc``, ``Swappiness``,
-    ``TrustQuickness``, ``TrustedTracker`` (list; replaces ``TrustedTrackerList`` from the wire).
+    ``TrustQuickness``, ``Timer_Interval_Hours``, ``TrustedTracker`` (list; replaces
+    ``TrustedTrackerList`` from the wire), ``Unhealth_Index``, ``Priority_Weights`` (object mapping
+    priority level to weight).
     """
     del node_address
     return {
@@ -26,15 +28,33 @@ def get_config(node_address: str) -> dict[str, Any]:
         "Swappiness": 0.5,
         "TrustQuickness": 1.0,
         "TrustedTracker": ["testtracker1.com"],
+        "Unhealth_Index": 0.5,
+        "Priority_Weights": {0: 1, 1: 2, 2: 3},
     }
 
 
 def get_init_files(remaining_size_bytes: int) -> list[str]:
     """
-    Return file ids to pull for an initial sync, targeting roughly ``remaining_size_bytes`` budget.
+    Return torrent file ids to pull for an initial sync, targeting roughly
+    ``remaining_size_bytes`` budget.
 
-    **Stub:** Returns a fixed list of placeholder ids when ``remaining_size_bytes > 0``.
+    **Stub:** Returns two placeholder ids per call; each invocation uses a new prefix so ids stay
+    unique across general vs health tiers (``storage.id`` is the torrent id).
     """
     if remaining_size_bytes <= 0:
         return []
-    return ["stub-file-1", "stub-file-2"]
+    get_init_files._wave = getattr(get_init_files, "_wave", 0) + 1
+    w = get_init_files._wave
+    return [f"stub-{w}-a", f"stub-{w}-b"]
+
+
+def fetch_metadata(torrent_id: str) -> tuple[dict[str, Any], int, int]:
+    """
+    Return ``(metadata, priority, size_bytes)`` for the torrent file ``torrent_id`` (same as
+    ``storage.id`` and the id passed to I2P). ``metadata`` is merged into the row's JSON;
+    ``priority`` updates ``storage.priority``; ``size_bytes`` updates ``storage.size``.
+
+    **Stub:** Ignores ``torrent_id`` and returns fixed values for local testing.
+    """
+    del torrent_id
+    return {"stub_meta": True}, 0, 1024

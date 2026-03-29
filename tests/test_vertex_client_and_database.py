@@ -4,6 +4,7 @@ Tests for :class:`vertex.client.VertexClient` and :mod:`vertex.db_setup` (SQLite
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 
 from vertex import DEFAULT_CONFIG, VertexClient
 from vertex import db_setup
+from vertex.health import health_equation
 
 
 # --- VertexClient: init & config ---
@@ -25,7 +27,7 @@ def test_init_creates_sqlite_tier_dirs_and_states(tmp_path: Path) -> None:
         assert (d / "emergency").is_dir()
         assert (d / "health_ind").is_dir()
         assert (d / "general").is_dir()
-        assert c.config == DEFAULT_CONFIG
+        assert c.config == {**DEFAULT_CONFIG, "Directory_Path": str(d.resolve())}
         assert len(c.states) == 8
         total = int(DEFAULT_CONFIG["Total_Storage"])
         e_frac = float(DEFAULT_CONFIG["Emergency_Storage_Perc"])
@@ -97,6 +99,7 @@ def test_config_persists_across_new_client(tmp_path: Path) -> None:
     try:
         assert b.config["Swappiness"] == 0.25
         assert b.config["Total_Storage"] == 999
+        assert b.config["Directory_Path"] == str(d.resolve())
         assert b.config["TrustQuickness"] == DEFAULT_CONFIG["TrustQuickness"]
     finally:
         b.close()
@@ -202,47 +205,26 @@ def test_storage_crud(tmp_path: Path) -> None:
     db = tmp_path / "s.sqlite"
     conn = db_setup.connect(db)
     db_setup.init_schema(conn)
-    i1 = db_setup.storage_insert(conn, "/a/x", '{"t":1}')
-    i2 = db_setup.storage_insert(conn, "/b/y", None, priority=3)
-    assert db_setup.storage_get(conn, i1)["file_location"] == "/a/x"
-    assert db_setup.storage_get(conn, i1)["priority"] == 0
-    assert db_setup.storage_get(conn, i2)["metadata"] is None
-    assert db_setup.storage_get(conn, i2)["priority"] == 3
+    db_setup.storage_insert(conn, "ta", "/a/x", '{"t":1}')
+    db_setup.storage_insert(conn, "tb", "/b/y", None, priority=3, size=99)
+    assert db_setup.storage_get(conn, "ta")["file_location"] == "/a/x"
+    assert db_setup.storage_get(conn, "ta")["priority"] == 0
+    assert db_setup.storage_get(conn, "ta")["size"] == 0
+    assert db_setup.storage_get(conn, "tb")["metadata"] is None
+    assert db_setup.storage_get(conn, "tb")["priority"] == 3
+    assert db_setup.storage_get(conn, "tb")["size"] == 99
     rows = db_setup.storage_list(conn)
     assert len(rows) == 2
-    assert rows[0]["id"] == i2
-    assert rows[1]["id"] == i1
-    db_setup.storage_update_priority(conn, i1, 10)
+    assert rows[0]["id"] == "tb"
+    assert rows[1]["id"] == "ta"
+    db_setup.storage_update_priority(conn, "ta", 10)
     rows = db_setup.storage_list(conn)
-    assert rows[0]["id"] == i1
-    db_setup.storage_delete(conn, i1)
-    assert db_setup.storage_get(conn, i1) is None
+    assert rows[0]["id"] == "ta"
+    db_setup.storage_update_metadata(conn, "ta", '{"t":2}')
+    assert json.loads(db_setup.storage_get(conn, "ta")["metadata"]) == {"t": 2}
+    db_setup.storage_delete(conn, "ta")
+    assert db_setup.storage_get(conn, "ta") is None
     assert len(db_setup.storage_list(conn)) == 1
-    conn.close()
-
-
-def test_storage_migrates_priority_on_legacy_db(tmp_path: Path) -> None:
-    db = tmp_path / "legacy.sqlite"
-    raw = sqlite3.connect(db)
-    raw.execute(
-        """
-        CREATE TABLE storage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_location TEXT NOT NULL,
-            metadata TEXT
-        )
-        """
-    )
-    raw.execute("INSERT INTO storage(file_location, metadata) VALUES('/legacy', NULL)")
-    raw.commit()
-    raw.close()
-
-    conn = db_setup.connect(db)
-    db_setup.init_schema(conn)
-    row = db_setup.storage_get(conn, 1)
-    assert row is not None
-    assert row["file_location"] == "/legacy"
-    assert row["priority"] == 0
     conn.close()
 
 
@@ -336,8 +318,8 @@ def test_client_connection_uses_same_db_file(tmp_path: Path) -> None:
     d = tmp_path / "vd"
     c = VertexClient(d)
     try:
-        sid = db_setup.storage_insert(c._connection, "/blob", None)
-        assert db_setup.storage_get(c._connection, sid)["file_location"] == "/blob"
+        db_setup.storage_insert(c._connection, "blob-id", "/blob", None)
+        assert db_setup.storage_get(c._connection, "blob-id")["file_location"] == "/blob"
     finally:
         c.close()
 
@@ -347,7 +329,7 @@ def test_full_workflow_init_then_tables(tmp_path: Path) -> None:
     c = VertexClient(d)
     try:
         db_setup.neighbor_upsert(c._connection, _pk(1), 1, 0)
-        db_setup.storage_insert(c._connection, "/f", "{}")
+        db_setup.storage_insert(c._connection, "f", "/f", "{}")
         db_setup.unhealth_upsert(c._connection, "x", 42)
         assert len(db_setup.neighbors_list(c._connection)) == 1
         assert len(db_setup.storage_list(c._connection)) == 1
@@ -379,6 +361,8 @@ def test_signup_sets_node_address_and_merges_node_config(
             "Swappiness": 0.99,
             "TrustQuickness": 0.5,
             "TrustedTracker": ["tr1"],
+            "Unhealth_Index": 0.25,
+            "Priority_Weights": {0: 10, 1: 20},
         }
 
     monkeypatch.setattr("vertex.client.NodeParser.get_config", fake_get)
@@ -388,6 +372,17 @@ def test_signup_sets_node_address_and_merges_node_config(
         assert c.config["NodeAddress"] == "https://node/"
         assert c.config["Swappiness"] == 0.99
         assert c.config["TrustedTracker"] == ["tr1"]
+        assert c.config["Unhealth_Index"] == 0.25
+        assert c.config["Priority_Weights"] == {0: 10, 1: 20}
+        rows = db_setup.storage_list(c._connection)
+        assert len(rows) == 4
+        assert len({r["id"] for r in rows}) == 4
+        assert sum(1 for r in rows if r["file_location"].startswith("general/")) == 2
+        assert sum(1 for r in rows if r["file_location"].startswith("health_ind/")) == 2
+        for r in rows:
+            tier, name = r["file_location"].split("/", 1)
+            assert r["id"] == name
+        assert all(r["size"] == 1024 for r in rows)
     finally:
         c.close()
 
@@ -398,13 +393,174 @@ def test_signup_calls_i2p_download_when_wired(
     from unittest.mock import MagicMock
 
     i2p = MagicMock()
-    monkeypatch.setattr(
-        "vertex.client.NodeParser.get_init_files",
-        lambda remaining: ["only-one"] if remaining > 0 else [],
-    )
+    _wave = [0]
+
+    def fake_init(remaining: int) -> list[str]:
+        if remaining <= 0:
+            return []
+        _wave[0] += 1
+        w = _wave[0]
+        return [f"only-{w}-x", f"only-{w}-y"]
+
+    monkeypatch.setattr("vertex.client.NodeParser.get_init_files", fake_init)
     c = VertexClient(tmp_path / "vd", i2p=i2p)
     try:
         c.signup("n")
-        assert i2p.download_file.call_count == 2
+        assert i2p.download_file.call_count == 4
+        rows = db_setup.storage_list(c._connection)
+        assert len(rows) == 4
+        assert {r["id"] for r in rows} == {"only-1-x", "only-1-y", "only-2-x", "only-2-y"}
+        assert {r["file_location"] for r in rows} == {
+            "general/only-1-x",
+            "general/only-1-y",
+            "health_ind/only-2-x",
+            "health_ind/only-2-y",
+        }
+        assert all(r["size"] == 1024 for r in rows)
+    finally:
+        c.close()
+
+
+def test_update_metadata_refreshes_storage_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    def fake_fetch(fid: str) -> tuple[dict, int, int]:
+        calls.append(fid)
+        n = len(calls)
+        return ({"rev": n}, n * 10, n * 1000)
+
+    monkeypatch.setattr("vertex.client.NodeParser.fetch_metadata", fake_fetch)
+    c = VertexClient(tmp_path / "vd")
+    try:
+        db_setup.storage_insert(c._connection, "a", "/a", json.dumps({"tag": "a"}))
+        db_setup.storage_insert(c._connection, "b", "/b", json.dumps({"tag": "b"}))
+        db_setup.storage_insert(c._connection, "c", "/c", None)
+        db_setup.storage_insert(c._connection, "d", "/d", "{}")
+        c.update_metadata()
+        assert sorted(calls) == ["a", "b", "c", "d"]
+        by_loc = {
+            r["file_location"]: r["metadata"]
+            for r in db_setup.storage_list(c._connection)
+        }
+        assert json.loads(by_loc["/a"])["rev"] == 1
+        assert json.loads(by_loc["/b"])["rev"] == 2
+        assert json.loads(by_loc["/c"])["rev"] == 3
+        assert json.loads(by_loc["/d"])["rev"] == 4
+        pri_by_loc = {
+            r["file_location"]: r["priority"]
+            for r in db_setup.storage_list(c._connection)
+        }
+        assert pri_by_loc["/a"] == 10
+        assert pri_by_loc["/b"] == 20
+        assert pri_by_loc["/c"] == 30
+        assert pri_by_loc["/d"] == 40
+        size_by_loc = {
+            r["file_location"]: r["size"]
+            for r in db_setup.storage_list(c._connection)
+        }
+        assert size_by_loc["/a"] == 1000
+        assert size_by_loc["/b"] == 2000
+        assert size_by_loc["/c"] == 3000
+        assert size_by_loc["/d"] == 4000
+    finally:
+        c.close()
+
+
+# --- get_health ---
+
+
+def test_get_health_uses_storage_priority(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    i2p = MagicMock()
+    i2p.count_seeders.return_value = 5
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        db_setup.storage_insert(
+            c._connection, "fx", "general/x", None, priority=7
+        )
+        h = c.get_health("fx")
+        assert h == health_equation(7, 5, DEFAULT_CONFIG["Priority_Weights"])
+        i2p.count_seeders.assert_called_once_with("fx", [])
+    finally:
+        c.close()
+
+
+def test_get_health_raises_when_torrent_not_in_storage(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    c = VertexClient(tmp_path / "vd", i2p=MagicMock())
+    try:
+        with pytest.raises(KeyError, match="unknown-torrent"):
+            c.get_health("unknown-torrent")
+    finally:
+        c.close()
+
+
+# --- update_atrisk_list ---
+
+
+def test_update_atrisk_list_removes_when_health_at_or_above_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.9)
+    c = VertexClient(tmp_path / "vd")
+    try:
+        db_setup.storage_insert(c._connection, "tx", "general/x", None)
+        db_setup.unhealth_upsert(c._connection, "tx", 50)
+        c.update_atrisk_list()
+        assert db_setup.unhealth_list(c._connection) == []
+    finally:
+        c.close()
+
+
+def test_update_atrisk_list_keeps_unhealth_when_below_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.1)
+    c = VertexClient(tmp_path / "vd")
+    try:
+        # Size must match storage: update_atrisk_list upserts unhealth from storage.size.
+        db_setup.storage_insert(c._connection, "tx", "general/x", None, size=50)
+        db_setup.unhealth_upsert(c._connection, "tx", 50)
+        c.update_atrisk_list()
+        rows = db_setup.unhealth_list(c._connection)
+        assert len(rows) == 1
+        assert rows[0]["id"] == "tx"
+        assert rows[0]["size"] == 50
+    finally:
+        c.close()
+
+
+def test_update_atrisk_list_adds_storage_rows_when_unhealthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.1)
+    c = VertexClient(tmp_path / "vd")
+    try:
+        db_setup.storage_insert(
+            c._connection, "tf", "general/f", None, size=123
+        )
+        c.update_atrisk_list()
+        row = db_setup.unhealth_get(c._connection, "tf")
+        assert row is not None
+        assert row["size"] == 123
+    finally:
+        c.close()
+
+
+def test_update_atrisk_list_skips_storage_when_healthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.9)
+    c = VertexClient(tmp_path / "vd")
+    try:
+        db_setup.storage_insert(
+            c._connection, "tf", "general/f", None, size=123
+        )
+        c.update_atrisk_list()
+        assert db_setup.unhealth_get(c._connection, "tf") is None
     finally:
         c.close()

@@ -22,8 +22,9 @@ from socketserver import ThreadingMixIn
 from typing import Any
 from urllib.parse import urlparse
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 __all__ = ["I2P", "DEFAULT_BROADCAST_PORT"]
 
@@ -53,6 +54,29 @@ def _nyaa_int(item: ET.Element, local: str) -> int:
         return int(t)
     except ValueError:
         return 0
+
+
+def _peer_ip_to_broadcast_base_url(ip: str, port: int = DEFAULT_BROADCAST_PORT) -> str:
+    """Build ``http://host:port`` for a qBittorrent peer ``ip`` (IPv4 or IPv6 string)."""
+    ip = ip.strip()
+    if not ip:
+        return ""
+    if ":" in ip and not ip.startswith("["):
+        host = f"[{ip}]"
+    else:
+        host = ip
+    return f"http://{host}:{port}"
+
+
+def _is_ed25519_public_key_hex(s: str) -> bool:
+    t = s.strip()
+    if len(t) != 64:
+        return False
+    try:
+        bytes.fromhex(t)
+    except ValueError:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in t)
 
 
 def _parse_nyaa_rss(xml: bytes, query: str, trackers: list[str]) -> dict[str, dict[str, Any]]:
@@ -190,6 +214,33 @@ class I2P:
                 url,
                 data=data,
                 method="POST",
+                headers={
+                    "Cookie": cookie,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = self._parse_rpc_response(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 403 and attempt == 0:
+                    self._rpc_session_id = None
+                    continue
+                raise
+            else:
+                return body
+        raise RuntimeError("qBittorrent API: retry exhausted")
+
+    def _rpc_get(self, method: str, arguments: dict) -> dict | list:
+        """GET to qBittorrent API (e.g. ``/sync/torrentPeers``)."""
+        qs = urllib.parse.urlencode(arguments)
+        url = self._rpc_url() + method + "?" + qs
+        for attempt in range(2):
+            if self._rpc_session_id is None:
+                self._login()
+            cookie = f"SID={self._rpc_session_id}"
+            req = urllib.request.Request(
+                url,
+                method="GET",
                 headers={
                     "Cookie": cookie,
                 },
@@ -380,15 +431,117 @@ class I2P:
             return
         self._rpc("/torrents/delete", {"hashes": torrent_hash, "deleteFiles": False})
 
+    def _neighbor_broadcast_base_urls_for_storage(self, storage_id: str) -> list[str]:
+        """
+        qBittorrent peer IPs for ``storage_id`` (info hash), as ``http://ip:port`` broadcast URLs
+        using :data:`DEFAULT_BROADCAST_PORT`. Peers with no usable IP (e.g. some I2P rows) are skipped.
+        """
+        torrent_hash = self._resolve_torrent_hash(storage_id)
+        if torrent_hash is None:
+            return []
+        try:
+            raw = self._rpc_get("/sync/torrentPeers", {"hash": torrent_hash, "rid": 0})
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return []
+            return []
+        except (urllib.error.URLError, OSError, TimeoutError):
+            return []
+        if not isinstance(raw, dict):
+            return []
+        peers = raw.get("peers")
+        if peers is None:
+            return []
+        if isinstance(peers, dict):
+            peer_rows = list(peers.values())
+        elif isinstance(peers, list):
+            peer_rows = peers
+        else:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in peer_rows:
+            if not isinstance(p, dict):
+                continue
+            ip = p.get("ip")
+            if not ip or not isinstance(ip, str):
+                continue
+            ip = ip.strip()
+            if not ip:
+                continue
+            base = _peer_ip_to_broadcast_base_url(ip)
+            if not base or base in seen:
+                continue
+            seen.add(base)
+            out.append(base)
+        return out
+
+    def _fetch_verified_neighbor_broadcast(self, base_url: str) -> tuple[str, str] | None:
+        """
+        ``GET /publickey`` (canonical key), ``GET /broadcast``, verify Ed25519 signature on
+        ``message`` with that key. Returns ``(pubkey_hex, message)`` or ``None``.
+        """
+        base = base_url.rstrip("/")
+        try:
+            publickey_req = urllib.request.Request(
+                f"{base}/publickey",
+                headers={"User-Agent": "vertex-client/0.1"},
+            )
+            with urllib.request.urlopen(publickey_req, timeout=15) as resp:
+                pk_text = resp.read().decode().strip()
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError):
+            return None
+        if not _is_ed25519_public_key_hex(pk_text):
+            return None
+        pubkey_hex = pk_text.lower()
+        if pubkey_hex == self.identity.lower():
+            return None
+        try:
+            broadcast_req = urllib.request.Request(
+                f"{base}/broadcast",
+                headers={"User-Agent": "vertex-client/0.1"},
+            )
+            with urllib.request.urlopen(broadcast_req, timeout=15) as resp:
+                broadcast_raw = resp.read().decode()
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError):
+            return None
+        try:
+            obj = json.loads(broadcast_raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        message = obj.get("message")
+        sig_hex = obj.get("signature")
+        if not isinstance(message, str) or not isinstance(sig_hex, str):
+            return None
+        sig_hex = sig_hex.strip()
+        if not sig_hex:
+            return None
+        try:
+            pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+            pk.verify(bytes.fromhex(sig_hex), message.encode())
+        except (InvalidSignature, ValueError, TypeError):
+            return None
+        return (pubkey_hex, message)
+
     def check_neighbors(self, storage_id: str) -> dict[str, str]:
         """
         Neighbor discovery for the torrent identified by ``storage_id`` (same as ``storage.id``,
-        the info hash matching qBittorrent's ``hash``). Return a map of neighbor public-key id
-        (hex string) to their latest broadcast payload (typically a JSON string of at-risk file
-        entries). **Stub:** empty map until wired.
+        the info hash matching qBittorrent's ``hash``). Uses qBittorrent ``/sync/torrentPeers`` to
+        list peer IPs, probes ``http://<ip>:DEFAULT_BROADCAST_PORT`` for each peer's Vertex broadcast
+        HTTP server, and returns a map of neighbor public key (from ``GET /publickey``) to the inner
+        ``message`` string from a signed ``GET /broadcast`` payload (same shape as
+        :meth:`update_broadcast`). Unverifiable or unreachable neighbors are omitted.
         """
-        del storage_id
-        return {}
+        out: dict[str, str] = {}
+        for base in self._neighbor_broadcast_base_urls_for_storage(storage_id):
+            got = self._fetch_verified_neighbor_broadcast(base)
+            if got is None:
+                continue
+            pk, msg = got
+            out[pk] = msg
+        return out
 
     def update_broadcast(self, message: str) -> None:
         """

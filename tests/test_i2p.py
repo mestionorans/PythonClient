@@ -345,3 +345,64 @@ def test_broadcast_base_url_before_start_raises(tmp_path):
     client = I2P(tmp_path)
     with pytest.raises(RuntimeError, match="update_broadcast"):
         _ = client.broadcast_base_url
+
+
+def test_check_neighbors_empty_when_no_broadcast_urls(monkeypatch, tmp_path):
+    client = I2P(tmp_path)
+    monkeypatch.setattr(I2P, "_neighbor_broadcast_base_urls_for_storage", lambda self, sid: [])
+    assert client.check_neighbors("a" * 40) == {}
+
+
+def test_check_neighbors_returns_verified_message(monkeypatch, tmp_path):
+    neighbor = I2P(tmp_path / "neighbor", broadcast_port=0)
+    payload = json.dumps([{"id": "a" * 40, "size": 42}])
+    neighbor.update_broadcast(payload)
+    base = neighbor.broadcast_base_url
+
+    client = I2P(tmp_path / "client")
+    monkeypatch.setattr(
+        I2P,
+        "_neighbor_broadcast_base_urls_for_storage",
+        lambda self, sid: [base],
+    )
+
+    out = client.check_neighbors("deadbeefcafebabe0000deadbeefcafebabe0000")
+    assert out == {neighbor.identity.lower(): payload}
+
+
+def test_check_neighbors_skips_invalid_signature(monkeypatch, tmp_path):
+    neighbor = I2P(tmp_path / "neighbor", broadcast_port=0)
+    neighbor.update_broadcast("[]")
+    base = neighbor.broadcast_base_url
+    # Valid publickey but corrupt the signed body so Ed25519 verification fails.
+    with neighbor._broadcast_lock:
+        neighbor._broadcast_body = json.dumps(
+            {"message": "[]", "signature": "ab" * 64}
+        ).encode()
+
+    client = I2P(tmp_path / "client")
+    monkeypatch.setattr(
+        I2P,
+        "_neighbor_broadcast_base_urls_for_storage",
+        lambda self, sid: [base],
+    )
+    assert client.check_neighbors("c" * 40) == {}
+
+
+def test_check_neighbors_skips_own_publickey(monkeypatch, tmp_path):
+    client = I2P(tmp_path, broadcast_port=0)
+    client.update_broadcast("[]")
+    base = client.broadcast_base_url
+    monkeypatch.setattr(
+        I2P,
+        "_neighbor_broadcast_base_urls_for_storage",
+        lambda self, sid: [base],
+    )
+    assert client.check_neighbors("b" * 40) == {}
+
+
+def test_peer_ip_to_broadcast_base_url_ipv6():
+    from vertex.i2p import _peer_ip_to_broadcast_base_url
+
+    assert _peer_ip_to_broadcast_base_url("2001:db8::1") == "http://[2001:db8::1]:28765"
+    assert _peer_ip_to_broadcast_base_url("192.168.0.1") == "http://192.168.0.1:28765"

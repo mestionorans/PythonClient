@@ -449,6 +449,8 @@ class VertexClient:
         :meth:`vertex.i2p.I2P.add_torrent` on ``self._i2p`` (so the torrent client registers the
         magnet) and inserts a ``storage`` row whose ``id`` is that torrent id and ``file_location``
         is ``<tier>/<torrent_id>``; ``size`` is filled by :meth:`update_metadata` from the node.
+        Those ids are the BitTorrent **info hash** (40 hex characters), the same string qBittorrent
+        uses as ``hash`` for that torrent in its Web API.
         """
         self.change_parameter("NodeAddress", node_address)
 

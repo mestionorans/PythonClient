@@ -1,5 +1,5 @@
 {
-  description = "Vertex Python client — dev shell with Python + pip (NiceGUI) ";
+  description = "Vertex Python client — dev shell with Python + pip + node (React UI)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -20,6 +20,8 @@
             # Needed to build pydantic-core (NiceGUI dependency) from source
             rustc
             cargo
+            # Frontend tooling (React)
+            nodejs
             (python3.withPackages (ps: with ps; [
               pip
               setuptools
@@ -38,19 +40,19 @@
               exit 1
             fi
 
-            # Ensure the local venv exists and has NiceGUI installed.
-            if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import nicegui" >/dev/null 2>&1; then
-              echo "vertex-gui: creating/recreating .venv (missing nicegui)."
+            # Ensure the local venv exists and has web deps installed.
+            if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import fastapi" >/dev/null 2>&1; then
+              echo "vertex: creating/recreating .venv (missing backend deps)."
               rm -rf .venv
               "$PYBIN" -m venv .venv
               . .venv/bin/activate
               python -m pip install -U pip setuptools wheel
               pip install -r requirements.txt
-              pip install -e '.[gui]'
+              pip install -e '.[dev]'
             fi
 
             echo "Vertex client — $(python --version)"
-            echo "  GUI check: python -c \"import nicegui; print('nicegui ok')\""
+            echo "  Node: $(node --version) / npm $(npm --version)"
           '';
         };
       });

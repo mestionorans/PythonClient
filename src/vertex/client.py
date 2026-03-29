@@ -480,12 +480,20 @@ class VertexClient:
 
         for fid in general_ids:
             dest = str(self._general_dir / fid)
-            self._i2p.add_torrent(dest, fid, trackers)
+            try:
+                self._i2p.add_torrent(dest, fid, trackers)
+            except RuntimeError as e:
+                # qBittorrent may reject magnets depending on daemon settings or hash formats.
+                # Signup should still initialize the node DB/config so the user can retry later.
+                print(f"warning: could not add initial torrent {fid!r}: {e}", file=sys.stderr)
             loc = _storage_file_location(_SUB_GENERAL, fid)
             _db.storage_insert(self._conn, fid, loc, None)
         for fid in health_ids:
             dest = str(self._health_ind_dir / fid)
-            self._i2p.add_torrent(dest, fid, trackers)
+            try:
+                self._i2p.add_torrent(dest, fid, trackers)
+            except RuntimeError as e:
+                print(f"warning: could not add initial torrent {fid!r}: {e}", file=sys.stderr)
             loc = _storage_file_location(_SUB_HEALTH_IND, fid)
             _db.storage_insert(self._conn, fid, loc, None)
 

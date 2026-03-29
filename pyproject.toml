@@ -14,11 +14,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
-gui = ["nicegui>=3.9.0"]
+web = ["fastapi>=0.109.1", "uvicorn[standard]>=0.24.0"]
 
 [project.scripts]
 vertex-cli = "CLI.app:main"
-vertex-gui = "GUI.app:main"
+vertex-web = "web.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

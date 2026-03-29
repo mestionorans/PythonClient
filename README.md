@@ -1,6 +1,6 @@
 # PythonClient
 
-Vertex client per the in-repo design doc: **JSON** snapshot persistence (`vertex_state.json`), **`permanent/` / `emergency/` / `non_permanent/`** quotas from **config**, **I2P** stubs (`grab_file`, `host_file`, `check_neighbor`, `broadcast`, …).
+Vertex client: **`vertex.sqlite`** (config + tables), **`VertexClient.config`** (see ``DEFAULT_CONFIG`` / module docstring in ``client.py``), **I2P** stubs. Legacy ``vertex.state`` module removed.
 
 ## Setup
 
@@ -19,12 +19,9 @@ pip install -e ".[dev]"     # editable install + dev deps
 
 ```python
 from pathlib import Path
-from vertex import VertexClient, VertexConfig
+from vertex import DEFAULT_CONFIG, VertexClient
 
 c = VertexClient(Path.home() / ".vertex")
-# c.save_config(VertexConfig(...))
-# c.on_launch_or_daily()
+# c.change_parameter("Total_Storage", ...)
 # c.close()
 ```
-
-Scheduling (e.g. “every hour” `check_neighbors` + `broadcast_at_risk`) is **out of scope**—call those methods from your own runner.

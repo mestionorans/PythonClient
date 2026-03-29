@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -16,6 +17,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 __all__ = ["I2P"]
 
 _SEED_PREFIX = b"VERTEX_SEED\x00"
+
+_QBITTORRENT_USERNAME = "admin"
+_QBITTORRENT_PASSWORD = "adminpassword"
 
 
 class I2P:
@@ -43,93 +47,114 @@ class I2P:
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
-        self.RPC_IP = "127.0.0.1:7657"
+        self.RPC_IP = "127.0.0.1:8080"
         self.identity: str = raw.hex()
         self._seed_signatures: dict[tuple[str, str], bytes] = {}
         self._rpc_session_id: str | None = None
 
     def _rpc_url(self) -> str:
-        return f"http://{self.RPC_IP}/transmission/rpc"
+        return f"http://{self.RPC_IP}/api/v2"
 
-    def _fetch_session_id(self) -> str:
-        req = urllib.request.Request(self._rpc_url(), method="GET")
+    def _login(self) -> None:
+        data = urllib.parse.urlencode({
+            "username": _QBITTORRENT_USERNAME,
+            "password": _QBITTORRENT_PASSWORD,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self._rpc_url()}/auth/login",
+            data=data,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+            if body != "Ok.":
+                raise RuntimeError(f"qBittorrent login failed: {body}")
+            sid = resp.headers.get("Set-Cookie", "").split("SID=")[1].split(";")[0]
+            self._rpc_session_id = sid
+
+    def _parse_rpc_response(self, raw: str) -> dict | list:
+        """Many qBittorrent v2 endpoints return empty bodies or plain text (e.g. ``Ok.`` / ``Fails.``), not JSON."""
+        text = raw.strip()
+        if not text:
+            return {}
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                sid = resp.headers.get("X-Transmission-Session-Id")
-        except urllib.error.HTTPError as e:
-            if e.code == 409:
-                sid = e.headers.get("X-Transmission-Session-Id")
-            else:
-                raise
-        if not sid:
-            raise RuntimeError("Transmission RPC: missing X-Transmission-Session-Id")
-        return sid.strip()
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        norm = text.lower().rstrip(".")
+        if norm == "ok":
+            return {}
+        if norm == "fails":
+            raise RuntimeError(
+                "qBittorrent rejected the request (e.g. duplicate torrent, invalid link, or bad parameters): "
+                f"{text!r}"
+            )
+        raise RuntimeError(f"qBittorrent API returned non-JSON body: {text!r}")
 
-    def _rpc(self, method: str, arguments: dict) -> dict:
+    def _rpc(self, method: str, arguments: dict) -> dict | list:
         """
-        JSON-RPC POST to Transmission. Returns the ``arguments`` object from the response.
+        POST to qbittorrent API. Returns parsed JSON (object or array), or an empty dict when the
+        body is empty or a plain ``Ok.``-style reply.
         """
-        url = self._rpc_url()
-        payload = json.dumps({"method": method, "arguments": arguments}).encode()
+        url = self._rpc_url() + method
+        if arguments:
+            data = urllib.parse.urlencode(arguments).encode()
+        else:
+            data = None
         for attempt in range(2):
             if self._rpc_session_id is None:
-                self._rpc_session_id = self._fetch_session_id()
+                self._login()
+            cookie = f"SID={self._rpc_session_id}"
             req = urllib.request.Request(
                 url,
-                data=payload,
+                data=data,
                 method="POST",
                 headers={
-                    "Content-Type": "application/json",
-                    "X-Transmission-Session-Id": self._rpc_session_id,
+                    "Cookie": cookie,
                 },
             )
             try:
                 with urllib.request.urlopen(req, timeout=120) as resp:
-                    body = json.loads(resp.read().decode())
+                    body = self._parse_rpc_response(resp.read().decode())
             except urllib.error.HTTPError as e:
-                if e.code == 409 and attempt == 0:
-                    self._rpc_session_id = (
-                        e.headers.get("X-Transmission-Session-Id") or self._fetch_session_id()
-                    )
+                if e.code == 403 and attempt == 0:
+                    self._rpc_session_id = None
                     continue
                 raise
             else:
-                if body.get("result") != "success":
-                    raise RuntimeError(f"Transmission RPC error: {body!r}")
-                return dict(body.get("arguments") or {})
-        raise RuntimeError("Transmission RPC: session retry exhausted")
+                return body
+        raise RuntimeError("qBittorrent API: retry exhausted")
 
     def _is_info_hash_hex(self, s: str) -> bool:
         return len(s) == 40 and all(c in "0123456789abcdefABCDEF" for c in s)
 
-    def _resolve_transmission_torrent_id(self, id_str: str) -> int | None:
+    def _resolve_torrent_hash(self, id_str: str) -> str | None:
         s = id_str.strip()
-        if s.isdigit():
-            return int(s)
         if self._is_info_hash_hex(s):
-            args = self._rpc("torrent-get", {"fields": ["id", "hashString"]})
-            target = s.lower()
-            for t in args.get("torrents", []):
-                hs = str(t.get("hashString", "")).lower()
-                if hs == target:
-                    tid = t.get("id")
-                    return int(tid) if tid is not None else None
+            return s.lower()
+        if s.isdigit():
+            args = self._rpc("/torrents/info", {"filter": "all"})
+            target = int(s)
+            for t in args:
+                if t.get("id") == target:
+                    return t.get("hash").lower()
             return None
         return None
 
     def is_seeding(self, id: str) -> bool:
         """
         True if this torrent is present in the local client and its status is seeding
-        (Transmission status ``6``).
+        (qBittorrent state includes " uploading").
         """
-        tid = self._resolve_transmission_torrent_id(id)
-        if tid is None:
+        torrent_hash = self._resolve_torrent_hash(id)
+        if torrent_hash is None:
             return False
-        args = self._rpc("torrent-get", {"ids": [tid], "fields": ["status"]})
-        torrents = args.get("torrents", [])
-        if not torrents:
-            return False
-        return int(torrents[0].get("status", 0)) == 6
+        args = self._rpc("/torrents/info", {"hashes": torrent_hash})
+        for t in args:
+            if t.get("hash", "").lower() == torrent_hash:
+                state = t.get("state", "")
+                return "uploading" in state or state == "pausedUP"
+        return False
 
     def download_file(self, file_path: str, id: str, trackers: list[str]) -> None:
         """
@@ -151,17 +176,17 @@ class I2P:
             magnet_parts.append(f"tr={quote(tracker)}")
         magnet_uri = "&".join(magnet_parts)
 
-        self._rpc("torrent-add", {"filename": magnet_uri})
+        self._rpc("/torrents/add", {"urls": magnet_uri})
 
     def delete_torrent(self, file_path: str, id: str) -> None:
         """
         Removes a torrent from the torrent client (RPC) and drops any local seed signature.
         """
         self._seed_signatures.pop((file_path, id), None)
-        tid = self._resolve_transmission_torrent_id(id)
-        if tid is None:
+        torrent_hash = self._resolve_torrent_hash(id)
+        if torrent_hash is None:
             return
-        self._rpc("torrent-remove", {"ids": [tid], "delete-local-data": False})
+        self._rpc("/torrents/delete", {"hashes": torrent_hash, "deleteFiles": False})
 
     def check_neighbors(self, storage_id: str) -> dict[str, str]:
         """
@@ -189,13 +214,13 @@ class I2P:
     def count_seeders(self, id: str, _requesting_seeder: str | None = None) -> int:
         """
         Queries the torrent client for the number of seeders on a torrent.
-        ``id`` is a Transmission torrent id (decimal string) or a 40-character info-hash hex.
+        ``id`` is a qBittorrent torrent id (decimal string) or a 40-character info-hash hex.
         """
-        tid = self._resolve_transmission_torrent_id(id)
-        if tid is None:
+        torrent_hash = self._resolve_torrent_hash(id)
+        if torrent_hash is None:
             return 0
-        args = self._rpc("torrent-get", {"ids": [tid], "fields": ["seeders"]})
-        torrents = args.get("torrents", [])
-        if not torrents:
-            return 0
-        return int(torrents[0].get("seeders", 0))
+        args = self._rpc("/torrents/info", {"hashes": torrent_hash})
+        for t in args:
+            if t.get("hash", "").lower() == torrent_hash:
+                return int(t.get("num_seeds", 0))
+        return 0

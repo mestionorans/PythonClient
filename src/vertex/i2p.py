@@ -174,9 +174,17 @@ class I2P:
         return {}
 
     def update_broadcast(self, message: str) -> None:
-        """Updates the broadcast to whatever message is provided.
-        Will also update the signed time stamp"""
-        pass
+        """Updates the broadcast to whatever message is provided."""
+        docroot = Path.home() / ".i2p" / "eepsite" / "docroot"
+        docroot.mkdir(parents=True, exist_ok=True)
+
+        publickey_path = docroot / "publickey"
+        publickey_path.write_text(self.identity)
+
+        signature = self._sk.sign(message.encode())
+        broadcast_path = docroot / "broadcast"
+        content = json.dumps({"message": message, "signature": signature.hex()})
+        broadcast_path.write_text(content)
 
     def count_seeders(self, id: str, _requesting_seeder: str | None = None) -> int:
         """

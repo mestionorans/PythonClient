@@ -1,10 +1,13 @@
+import json
+from pathlib import Path
 from urllib.parse import quote
 
 from vertex.i2p import I2P
 
 
 def test_add_torrent_builds_magnet_and_calls_rpc(monkeypatch, tmp_path):
-		# Arrange
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
 		file_path = "example file.txt"
 		torrent_id = "343b3e5adda3e7808edc6198961c630104ac3c28"
 		tracker = "http://tracker2.postman.i2p/announce.php"
@@ -17,11 +20,9 @@ def test_add_torrent_builds_magnet_and_calls_rpc(monkeypatch, tmp_path):
 
 		monkeypatch.setattr(I2P, "_rpc", fake_rpc)
 
-		# Act
 		client = I2P(tmp_path)
 		client.add_torrent(file_path, torrent_id, [tracker])
 
-		# Assert
 		assert len(calls) == 1
 		method, args = calls[0]
 		assert method == "torrent-add"
@@ -50,6 +51,7 @@ def test_download_file_delegates_to_add_torrent(monkeypatch, tmp_path):
 
 
 def test_delete_torrent_pops_signature_and_calls_rpc(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
 		calls: list[tuple[str, dict]] = []
 
 		def fake_rpc(self, method: str, arguments: dict) -> dict:
@@ -63,15 +65,14 @@ def test_delete_torrent_pops_signature_and_calls_rpc(monkeypatch, tmp_path):
 		client = I2P(tmp_path)
 		client._seed_signatures = {("/tmp/fake.bin", "a" * 40): b"sig"}
 
-		# Act: should not raise, remove local signature, and call RPC remove
 		client.delete_torrent("/tmp/fake.bin", "a" * 40)
 
-		# Assert
 		assert client._seed_signatures.get(("/tmp/fake.bin", "a" * 40)) is None
 		assert any(c == ("torrent-remove", {"ids": [9], "delete-local-data": False}) for c in calls)
 
 
 def test_delete_torrent_numeric_id(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
 		calls: list[tuple[str, dict]] = []
 
 		def fake_rpc(self, method: str, arguments: dict) -> dict:
@@ -87,6 +88,8 @@ def test_delete_torrent_numeric_id(monkeypatch, tmp_path):
 
 
 def test_count_seeders_returns_int_zero(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
 		def fake_rpc(self, method: str, arguments: dict) -> dict:
 				return {"torrents": []}
 
@@ -99,6 +102,8 @@ def test_count_seeders_returns_int_zero(monkeypatch, tmp_path):
 
 
 def test_count_seeders_returns_seeder_count(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
 		def fake_rpc(self, method: str, arguments: dict) -> dict:
 				if method == "torrent-get" and arguments.get("fields") == ["seeders"]:
 						return {"torrents": [{"seeders": 5}]}
@@ -112,6 +117,7 @@ def test_count_seeders_returns_seeder_count(monkeypatch, tmp_path):
 
 
 def test_count_seeders_unknown_id_no_rpc(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
 		calls: list[tuple[str, dict]] = []
 
 		def fake_rpc(self, method: str, arguments: dict) -> dict:
@@ -124,3 +130,32 @@ def test_count_seeders_unknown_id_no_rpc(monkeypatch, tmp_path):
 		n = client.count_seeders("not-a-valid-id")
 		assert n == 0
 		assert calls == []
+
+
+def test_update_broadcast_writes_signed_json(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+		client = I2P(tmp_path)
+		client.update_broadcast("hello world")
+
+		broadcast_file = tmp_path / ".i2p" / "eepsite" / "docroot" / "broadcast"
+		content = json.loads(broadcast_file.read_text())
+		assert content["message"] == "hello world"
+		assert len(content["signature"]) == 128
+
+		publickey_file = tmp_path / ".i2p" / "eepsite" / "docroot" / "publickey"
+		assert publickey_file.read_text() == client.identity
+
+
+def test_update_broadcast_creates_parent_dirs(monkeypatch, tmp_path):
+		monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+		client = I2P(tmp_path)
+		client.update_broadcast("test message")
+
+		broadcast_path = tmp_path / ".i2p" / "eepsite" / "docroot" / "broadcast"
+		content = json.loads(broadcast_path.read_text())
+		assert content["message"] == "test message"
+
+		publickey_path = tmp_path / ".i2p" / "eepsite" / "docroot" / "publickey"
+		assert publickey_path.read_text() == client.identity

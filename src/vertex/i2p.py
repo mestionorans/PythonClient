@@ -5,9 +5,10 @@ until wired to the network.
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
-
-from xmlrpc.client import ServerProxy
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -44,6 +45,77 @@ class I2P:
         )
         self.RPC_IP = "127.0.0.1:7657"
         self.identity: str = raw.hex()
+        self._seed_signatures: dict[tuple[str, str], bytes] = {}
+        self._rpc_session_id: str | None = None
+
+    def _rpc_url(self) -> str:
+        return f"http://{self.RPC_IP}/transmission/rpc"
+
+    def _fetch_session_id(self) -> str:
+        req = urllib.request.Request(self._rpc_url(), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                sid = resp.headers.get("X-Transmission-Session-Id")
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                sid = e.headers.get("X-Transmission-Session-Id")
+            else:
+                raise
+        if not sid:
+            raise RuntimeError("Transmission RPC: missing X-Transmission-Session-Id")
+        return sid.strip()
+
+    def _rpc(self, method: str, arguments: dict) -> dict:
+        """
+        JSON-RPC POST to Transmission. Returns the ``arguments`` object from the response.
+        """
+        url = self._rpc_url()
+        payload = json.dumps({"method": method, "arguments": arguments}).encode()
+        for attempt in range(2):
+            if self._rpc_session_id is None:
+                self._rpc_session_id = self._fetch_session_id()
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Transmission-Session-Id": self._rpc_session_id,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 409 and attempt == 0:
+                    self._rpc_session_id = (
+                        e.headers.get("X-Transmission-Session-Id") or self._fetch_session_id()
+                    )
+                    continue
+                raise
+            else:
+                if body.get("result") != "success":
+                    raise RuntimeError(f"Transmission RPC error: {body!r}")
+                return dict(body.get("arguments") or {})
+        raise RuntimeError("Transmission RPC: session retry exhausted")
+
+    def _is_info_hash_hex(self, s: str) -> bool:
+        return len(s) == 40 and all(c in "0123456789abcdefABCDEF" for c in s)
+
+    def _resolve_transmission_torrent_id(self, id_str: str) -> int | None:
+        s = id_str.strip()
+        if s.isdigit():
+            return int(s)
+        if self._is_info_hash_hex(s):
+            args = self._rpc("torrent-get", {"fields": ["id", "hashString"]})
+            target = s.lower()
+            for t in args.get("torrents", []):
+                hs = str(t.get("hashString", "")).lower()
+                if hs == target:
+                    tid = t.get("id")
+                    return int(tid) if tid is not None else None
+            return None
+        return None
 
     def download_file(self, file_path: str, id: str, trackers: list[str]) -> None:
         """Downloads a file given an id and tracker lists. Functions similar to add_torrent but will not seed after downloading"""
@@ -62,14 +134,17 @@ class I2P:
             magnet_parts.append(f"tr={quote(tracker)}")
         magnet_uri = "&".join(magnet_parts)
 
-        with ServerProxy(f"http://{self.RPC_IP}") as proxy:
-            proxy.core.add_torrent_url(magnet_uri, {})
+        self._rpc("torrent-add", {"filename": magnet_uri})
 
-    def delete_torrent(self, _torrent_id: str) -> None:
+    def delete_torrent(self, file_path: str, id: str) -> None:
         """
-        Removes a torrent from the torrent client
+        Removes a torrent from the torrent client (RPC) and drops any local seed signature.
         """
-        pass
+        self._seed_signatures.pop((file_path, id), None)
+        tid = self._resolve_transmission_torrent_id(id)
+        if tid is None:
+            return
+        self._rpc("torrent-remove", {"ids": [tid], "delete-local-data": False})
 
     def check_neighbours(self, id: str):
         """
@@ -84,6 +159,16 @@ class I2P:
         Will also update the signed time stamp"""
         pass
 
-    def count_seeders(self, id: str, trackers: list[str]) -> int:
-        """Number of seeders for the torrent identified by ``id`` (stub: always 0)."""
-        return 0
+    def count_seeders(self, id: str, _requesting_seeder: str | None = None) -> int:
+        """
+        Queries the torrent client for the number of seeders on a torrent.
+        ``id`` is a Transmission torrent id (decimal string) or a 40-character info-hash hex.
+        """
+        tid = self._resolve_transmission_torrent_id(id)
+        if tid is None:
+            return 0
+        args = self._rpc("torrent-get", {"ids": [tid], "fields": ["seeders"]})
+        torrents = args.get("torrents", [])
+        if not torrents:
+            return 0
+        return int(torrents[0].get("seeders", 0))

@@ -28,4 +28,5 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "integration: tests that exercise CLI + VertexClient with temp dirs (not live I2P)",
+    "qbittorrent_integration: requires a live qBittorrent Web API (VERTEX_QBIT_INTEGRATION=1)",
 ]

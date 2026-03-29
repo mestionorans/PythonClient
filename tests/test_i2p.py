@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from urllib.parse import quote
 
 import pytest
 
@@ -17,10 +16,26 @@ _TRACKERS = [
 ]
 
 
+def _magnet_value(s: str) -> str:
+    return s.replace("%", "%25").replace("&", "%26").replace("=", "%3D")
+
+
 def _expected_magnet(file_path: str, torrent_id: str, trackers: list[str]) -> str:
-    parts = [f"magnet:?xt=urn:btih:{torrent_id}", f"dn={quote(file_path)}"]
-    parts.extend(f"tr={quote(tr)}" for tr in trackers)
+    h = torrent_id.strip()
+    if len(h) == 40 and all(c in "0123456789abcdefABCDEF" for c in h):
+        h = h.lower()
+    parts = [f"magnet:?xt=urn:btih:{h}", f"dn={_magnet_value(file_path)}"]
+    parts.extend(f"tr={_magnet_value(tr)}" for tr in trackers)
     return "&".join(parts)
+
+
+def _expected_torrents_add_args(file_path: str, torrent_id: str, trackers: list[str]) -> dict:
+    p = Path(file_path).expanduser().resolve()
+    return {
+        "urls": _expected_magnet(file_path, torrent_id, trackers),
+        "savepath": str(p.parent),
+        "rename": p.name,
+    }
 
 
 def test_add_torrent_matches_manual_qbittorrent_command(monkeypatch, tmp_path):
@@ -39,17 +54,14 @@ def test_add_torrent_matches_manual_qbittorrent_command(monkeypatch, tmp_path):
     client.add_torrent(file_path, _INFO_HASH, list(_TRACKERS))
 
     assert calls == [
-        (
-            "/torrents/add",
-            {"urls": _expected_magnet(file_path, _INFO_HASH, _TRACKERS)},
-        )
+        ("/torrents/add", _expected_torrents_add_args(file_path, _INFO_HASH, _TRACKERS)),
     ]
 
 
 def test_add_torrent_builds_magnet_and_calls_rpc(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-    file_path = "example file.txt"
+    file_path = str(tmp_path / "nested" / "example file.txt")
     torrent_id = "343b3e5adda3e7808edc6198961c630104ac3c28"
     tracker = "http://tracker2.postman.i2p/announce.php"
 
@@ -67,20 +79,50 @@ def test_add_torrent_builds_magnet_and_calls_rpc(monkeypatch, tmp_path):
     assert len(calls) == 1
     method, args = calls[0]
     assert method == "/torrents/add"
-    assert args == {"urls": _expected_magnet(file_path, torrent_id, [tracker])}
+    assert args == _expected_torrents_add_args(file_path, torrent_id, [tracker])
 
 
-def test_download_file_delegates_to_add_torrent(monkeypatch, tmp_path):
-    calls: list[tuple[str, str, list[str]]] = []
+def test_download_file_same_registration_as_add_torrent(monkeypatch, tmp_path):
+    calls: list[tuple[str, dict]] = []
 
-    def fake_add(self, file_path: str, torrent_id: str, trackers: list[str]) -> None:
-        calls.append((file_path, torrent_id, trackers))
+    def fake_rpc(self, method: str, arguments: dict) -> dict:
+        calls.append((method, arguments))
+        return {}
 
-    monkeypatch.setattr(I2P, "add_torrent", fake_add)
+    monkeypatch.setattr(I2P, "_rpc", fake_rpc)
+
+    fp = str(tmp_path / "dl" / "blob.bin")
+    th = "a" * 40
+    trs = ["http://tr/announce"]
     client = I2P(tmp_path)
-    client.download_file("/data/x", "a" * 40, ["http://tr/"])
+    client.download_file(fp, th, trs, wait_complete=False)
+    client.add_torrent(fp, th, trs)
 
-    assert calls == [("/data/x", "a" * 40, ["http://tr/"])]
+    assert len(calls) == 2
+    assert calls[0] == calls[1] == ("/torrents/add", _expected_torrents_add_args(fp, th, trs))
+
+
+def test_download_file_wait_complete_polls_torrent_info(monkeypatch, tmp_path):
+    th = "c" * 40
+    n_info = {"count": 0}
+
+    def fake_rpc(self, method: str, arguments: dict) -> dict | list:
+        if method == "/torrents/add":
+            return {}
+        if method == "/torrents/info" and arguments.get("hashes") == th.lower():
+            n_info["count"] += 1
+            if n_info["count"] < 3:
+                return [{"hash": th.upper(), "state": "downloading", "progress": 0.4}]
+            return [{"hash": th, "state": "uploading", "progress": 1.0}]
+        return []
+
+    monkeypatch.setattr(I2P, "_rpc", fake_rpc)
+    monkeypatch.setattr("vertex.i2p.time.sleep", lambda _s: None)
+
+    client = I2P(tmp_path)
+    client.download_file(str(tmp_path / "f.bin"), th, [], wait_complete=True)
+
+    assert n_info["count"] == 3
 
 
 def test_delete_torrent_pops_signature_and_calls_rpc(monkeypatch, tmp_path):

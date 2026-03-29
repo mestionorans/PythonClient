@@ -1,11 +1,16 @@
 """
 I2P boundary (stubs). :class:`I2P` holds Ed25519 identity; methods are no-ops or local-only
 until wired to the network.
+
+Torrent identifiers in Vertex are the **BitTorrent info hash** (40 hex characters). That string is
+the same value qBittorrent exposes as ``hash`` in ``torrents/info`` and accepts in ``hashes`` for
+delete and info calls—no separate “internal id” is used at the application layer.
 """
 
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +33,10 @@ class I2P:
     ``data_dir`` is the same writable tree as :class:`~vertex.client.VertexClient` (database,
     tier folders, and any I2P-local state). Installed packages are often read-only; do not use the
     install prefix here.
+
+    **Torrent ids:** Callers should pass the **info hash** (40-character hex), identical to
+    qBittorrent's ``hash`` field for that torrent. ``storage.id`` / ``torrent_id`` parameters are
+    defined to match that hash one-to-one.
 
     ``identity`` is the hex-encoded public key. Seeding signs with the given ``key`` or
     the instance private key. ``add_torrent`` should re-sign on a schedule (see config
@@ -134,11 +143,15 @@ class I2P:
         if self._is_info_hash_hex(s):
             return s.lower()
         if s.isdigit():
+            # qBittorrent 4.x included `id` on each torrents/info row; 5.x list items are hash-keyed
+            # and typically omit `id`, so decimal ids may not resolve—prefer the 40-char info hash.
             args = self._rpc("/torrents/info", {"filter": "all"})
             target = int(s)
             for t in args:
-                if t.get("id") == target:
-                    return t.get("hash").lower()
+                qid = t.get("id")
+                if qid is not None and int(qid) == target:
+                    h = t.get("hash")
+                    return str(h).lower() if h else None
             return None
         return None
 
@@ -146,6 +159,9 @@ class I2P:
         """
         True if this torrent is present in the local client and its status is seeding
         (qBittorrent state includes " uploading").
+
+        ``id`` is the torrent **info hash** (same string as qBittorrent's ``hash``), not a UI-only
+        numeric id.
         """
         torrent_hash = self._resolve_torrent_hash(id)
         if torrent_hash is None:
@@ -157,27 +173,98 @@ class I2P:
                 return "uploading" in state or state == "pausedUP"
         return False
 
-    def download_file(self, file_path: str, id: str, trackers: list[str]) -> None:
+    def _magnet_uri(self, file_path: str, torrent_id: str, trackers: list[str]) -> str:
+        """Magnet for ``urls``; values are not pre-percent-encoded so ``urlencode`` is only one layer."""
+        h = torrent_id.strip()
+        if self._is_info_hash_hex(h):
+            h = h.lower()
+        magnet_parts = [f"magnet:?xt=urn:btih:{h}"]
+
+        def _magnet_value(s: str) -> str:
+            return s.replace("%", "%25").replace("&", "%26").replace("=", "%3D")
+
+        magnet_parts.append(f"dn={_magnet_value(file_path)}")
+        for tracker in trackers:
+            magnet_parts.append(f"tr={_magnet_value(tracker)}")
+        return "&".join(magnet_parts)
+
+    def _torrents_add_at_path(self, file_path: str, torrent_id: str, trackers: list[str]) -> None:
         """
-        Register the torrent with the client (same as :meth:`add_torrent`). The Vertex client uses
-        ``add_torrent`` for all storage-backed downloads so SQLite and the torrent client stay aligned.
+        Tell qBittorrent to add the magnet and store payload under the parent of ``file_path``,
+        using ``rename`` so the torrent root / single-file name matches the destination basename.
         """
-        self.add_torrent(file_path, id, trackers)
+        dest = Path(file_path).expanduser().resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        magnet_uri = self._magnet_uri(file_path, torrent_id, trackers)
+        self._rpc(
+            "/torrents/add",
+            {
+                "urls": magnet_uri,
+                "savepath": str(dest.parent),
+                "rename": dest.name,
+            },
+        )
+
+    def _wait_for_download(
+        self,
+        id_str: str,
+        *,
+        timeout_sec: float,
+        poll_interval_sec: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            torrent_hash = self._resolve_torrent_hash(id_str)
+            if torrent_hash is None:
+                time.sleep(poll_interval_sec)
+                continue
+            args = self._rpc("/torrents/info", {"hashes": torrent_hash})
+            t = next((x for x in args if str(x.get("hash", "")).lower() == torrent_hash), None)
+            if t is None:
+                time.sleep(poll_interval_sec)
+                continue
+            state = str(t.get("state", ""))
+            progress = float(t.get("progress", 0.0))
+            if state in ("missingFiles", "error"):
+                raise RuntimeError(f"qBittorrent torrent {torrent_hash!r} is in state {state!r}")
+            if progress >= 1.0 or state in ("stalledUP", "uploading", "pausedUP", "queuedUP"):
+                return
+            time.sleep(poll_interval_sec)
+        raise TimeoutError(f"Timed out after {timeout_sec}s waiting for torrent {id_str!r} to finish.")
+
+    def download_file(
+        self,
+        file_path: str,
+        id: str,
+        trackers: list[str],
+        *,
+        wait_complete: bool = False,
+        wait_timeout_sec: float = 86400.0,
+        poll_interval_sec: float = 2.0,
+    ) -> None:
+        """
+        Register the magnet with qBittorrent and set **save path** and **rename** so data is aimed
+        at ``file_path`` (parent directory + basename). Optionally block until the client reports
+        the download finished (progress 1.0 or seeding-like state).
+
+        ``id`` is the **info hash** (40 hex chars), aligned with qBittorrent's ``hash`` for the job.
+
+        :meth:`add_torrent` uses the same RPC shape; Vertex can keep calling ``add_torrent`` for
+        parity with storage paths.
+        """
+        self._torrents_add_at_path(file_path, id, trackers)
+        if wait_complete:
+            self._wait_for_download(id_str=id, timeout_sec=wait_timeout_sec, poll_interval_sec=poll_interval_sec)
 
     def add_torrent(self, file_path: str, torrent_id: str, trackers: list[str]) -> None:
         """
-        Generate a magnet link from the given info and send it to the torrent client via RPC.
+        Generate a magnet link from the given info and send it to the torrent client via RPC with
+        ``savepath`` / ``rename`` derived from ``file_path`` so downloads land next to the
+        storage path the client uses.
+
+        ``torrent_id`` is the **info hash** (40 hex chars), same value as qBittorrent's ``hash``.
         """
-        from urllib.parse import quote
-
-        magnet_parts = [f"magnet:?xt=urn:btih:{torrent_id}"]
-        name = quote(file_path)
-        magnet_parts.append(f"dn={name}")
-        for tracker in trackers:
-            magnet_parts.append(f"tr={quote(tracker)}")
-        magnet_uri = "&".join(magnet_parts)
-
-        self._rpc("/torrents/add", {"urls": magnet_uri})
+        self._torrents_add_at_path(file_path, torrent_id, trackers)
 
     def search(self, search_str: str, trackers: list[str]) -> dict[str, Any]:
         """
@@ -200,6 +287,9 @@ class I2P:
     def delete_torrent(self, file_path: str, id: str) -> None:
         """
         Removes a torrent from the torrent client (RPC) and drops any local seed signature.
+
+        ``id`` is the **info hash** (40 hex chars), matching qBittorrent's ``hash`` for RPC
+        ``hashes=``.
         """
         self._seed_signatures.pop((file_path, id), None)
         torrent_hash = self._resolve_torrent_hash(id)
@@ -209,10 +299,10 @@ class I2P:
 
     def check_neighbors(self, storage_id: str) -> dict[str, str]:
         """
-        Neighbor discovery for the torrent identified by ``storage_id`` (same id as ``storage.id`` /
-        I2P torrent id). Return a map of neighbor public-key id (hex string) to their latest
-        broadcast payload (typically a JSON string of at-risk file entries). **Stub:** empty map
-        until wired.
+        Neighbor discovery for the torrent identified by ``storage_id`` (same as ``storage.id``,
+        the info hash matching qBittorrent's ``hash``). Return a map of neighbor public-key id
+        (hex string) to their latest broadcast payload (typically a JSON string of at-risk file
+        entries). **Stub:** empty map until wired.
         """
         del storage_id
         return {}
@@ -233,7 +323,10 @@ class I2P:
     def count_seeders(self, id: str, _requesting_seeder: str | None = None) -> int:
         """
         Queries the torrent client for the number of seeders on a torrent.
-        ``id`` is a qBittorrent torrent id (decimal string) or a 40-character info-hash hex.
+
+        In normal Vertex usage, ``id`` is the **info hash** (40 hex chars), identical to
+        qBittorrent's ``hash``. A decimal string is accepted only as a legacy fallback when the Web
+        API exposes a per-torrent ``id`` (older clients); prefer the hash.
         """
         torrent_hash = self._resolve_torrent_hash(id)
         if torrent_hash is None:

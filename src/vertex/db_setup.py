@@ -4,6 +4,9 @@ SQLite helpers for the Vertex client: schema init, config persistence, storage, 
 The ``storage`` table uses ``id TEXT PRIMARY KEY``: the torrent / download file id (same id passed to
 I2P). Columns: ``file_location`` (tier path under the data root), ``metadata``, ``size`` (bytes),
 ``priority`` (integer; higher values sort first in ``storage_list``).
+
+The ``neighbors`` table stores ``public_key``, ``trust`` (1 trusted / -1 banned / 0 pending),
+``times_found``, and ``penalties`` (accumulated penalty count).
 """
 
 from __future__ import annotations
@@ -26,11 +29,13 @@ __all__ = [
     "storage_update_metadata",
     "storage_update_priority",
     "storage_update_size",
+    "storage_update_file_location",
     "neighbor_upsert",
     "neighbor_get",
     "neighbors_list",
     "neighbor_delete",
     "neighbor_increment_times",
+    "neighbor_increment_penalties",
     "unhealth_upsert",
     "unhealth_get",
     "unhealth_list",
@@ -65,7 +70,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS neighbors (
             public_key TEXT PRIMARY KEY,
             trust INTEGER NOT NULL,
-            times_found INTEGER NOT NULL DEFAULT 0
+            times_found INTEGER NOT NULL DEFAULT 0,
+            penalties INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS unhealth (
@@ -74,6 +80,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _migrate_neighbors_penalties(conn)
+
+
+def _migrate_neighbors_penalties(conn: sqlite3.Connection) -> None:
+    """Add ``penalties`` to ``neighbors`` when opening DBs created before that column existed."""
+    rows = conn.execute("PRAGMA table_info(neighbors)").fetchall()
+    if not rows:
+        return
+    names = {str(r["name"]) for r in rows}
+    if "penalties" in names:
+        return
+    conn.execute("ALTER TABLE neighbors ADD COLUMN penalties INTEGER NOT NULL DEFAULT 0")
 
 
 def _json_dumps(value: Any) -> str:
@@ -177,11 +195,20 @@ def storage_update_size(conn: sqlite3.Connection, torrent_id: str, size: int) ->
     )
 
 
+def storage_update_file_location(
+    conn: sqlite3.Connection, torrent_id: str, file_location: str
+) -> None:
+    conn.execute(
+        "UPDATE storage SET file_location = ? WHERE id = ?",
+        (file_location, torrent_id),
+    )
+
+
 def storage_delete(conn: sqlite3.Connection, torrent_id: str) -> None:
     conn.execute("DELETE FROM storage WHERE id = ?", (torrent_id,))
 
 
-# --- neighbors: trust 1 = trusted, -1 = banned, 0 = pending ---
+# --- neighbors: trust 1 = trusted, -1 = banned, 0 = pending; penalties = accumulated count ---
 
 
 def neighbor_upsert(
@@ -189,20 +216,27 @@ def neighbor_upsert(
     public_key: str,
     trust: int,
     times_found: int | None = None,
+    penalties: int | None = None,
 ) -> None:
-    if times_found is None:
-        row = conn.execute(
-            "SELECT times_found FROM neighbors WHERE public_key = ?", (public_key,)
+    existing = None
+    if times_found is None or penalties is None:
+        existing = conn.execute(
+            "SELECT times_found, penalties FROM neighbors WHERE public_key = ?",
+            (public_key,),
         ).fetchone()
-        times_found = int(row["times_found"]) if row else 0
+    if times_found is None:
+        times_found = int(existing["times_found"]) if existing else 0
+    if penalties is None:
+        penalties = int(existing["penalties"]) if existing else 0
     conn.execute(
         """
-        INSERT INTO neighbors(public_key, trust, times_found) VALUES(?, ?, ?)
+        INSERT INTO neighbors(public_key, trust, times_found, penalties) VALUES(?, ?, ?, ?)
         ON CONFLICT(public_key) DO UPDATE SET
             trust = excluded.trust,
-            times_found = excluded.times_found
+            times_found = excluded.times_found,
+            penalties = excluded.penalties
         """,
-        (public_key, trust, times_found),
+        (public_key, trust, times_found, penalties),
     )
 
 
@@ -224,7 +258,7 @@ def neighbor_delete(conn: sqlite3.Connection, public_key: str) -> None:
 def neighbor_increment_times(conn: sqlite3.Connection, public_key: str) -> int:
     conn.execute(
         """
-        INSERT INTO neighbors(public_key, trust, times_found) VALUES(?, 0, 1)
+        INSERT INTO neighbors(public_key, trust, times_found, penalties) VALUES(?, 0, 1, 0)
         ON CONFLICT(public_key) DO UPDATE SET times_found = times_found + 1
         """,
         (public_key,),
@@ -233,6 +267,18 @@ def neighbor_increment_times(conn: sqlite3.Connection, public_key: str) -> int:
         "SELECT times_found FROM neighbors WHERE public_key = ?", (public_key,)
     ).fetchone()
     return int(row["times_found"]) if row else 0
+
+
+def neighbor_increment_penalties(conn: sqlite3.Connection, public_key: str) -> int:
+    """Increment ``penalties`` by one for an existing neighbor row; return the new count."""
+    conn.execute(
+        "UPDATE neighbors SET penalties = penalties + 1 WHERE public_key = ?",
+        (public_key,),
+    )
+    row = conn.execute(
+        "SELECT penalties FROM neighbors WHERE public_key = ?", (public_key,)
+    ).fetchone()
+    return int(row["penalties"]) if row else 0
 
 
 # --- unhealth: id = same torrent id as storage ---

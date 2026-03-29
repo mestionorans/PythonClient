@@ -36,6 +36,19 @@ def test_add_torrent_builds_magnet_and_calls_rpc(monkeypatch, tmp_path):
 		assert magnet_uri == expected_uri
 
 
+def test_download_file_delegates_to_add_torrent(monkeypatch, tmp_path):
+		calls: list[tuple[str, str, list[str]]] = []
+
+		def fake_add(self, file_path: str, torrent_id: str, trackers: list[str]) -> None:
+				calls.append((file_path, torrent_id, trackers))
+
+		monkeypatch.setattr(I2P, "add_torrent", fake_add)
+		client = I2P(tmp_path)
+		client.download_file("/data/x", "a" * 40, ["http://tr/"])
+
+		assert calls == [("/data/x", "a" * 40, ["http://tr/"])]
+
+
 def test_delete_torrent_pops_signature_and_calls_rpc(monkeypatch, tmp_path):
 		calls: list[tuple[str, dict]] = []
 

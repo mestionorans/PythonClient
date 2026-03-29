@@ -117,9 +117,26 @@ class I2P:
             return None
         return None
 
+    def is_seeding(self, id: str) -> bool:
+        """
+        True if this torrent is present in the local client and its status is seeding
+        (Transmission status ``6``).
+        """
+        tid = self._resolve_transmission_torrent_id(id)
+        if tid is None:
+            return False
+        args = self._rpc("torrent-get", {"ids": [tid], "fields": ["status"]})
+        torrents = args.get("torrents", [])
+        if not torrents:
+            return False
+        return int(torrents[0].get("status", 0)) == 6
+
     def download_file(self, file_path: str, id: str, trackers: list[str]) -> None:
-        """Downloads a file given an id and tracker lists. Functions similar to add_torrent but will not seed after downloading"""
-        pass
+        """
+        Register the torrent with the client (same as :meth:`add_torrent`). The Vertex client uses
+        ``add_torrent`` for all storage-backed downloads so SQLite and the torrent client stay aligned.
+        """
+        self.add_torrent(file_path, id, trackers)
 
     def add_torrent(self, file_path: str, torrent_id: str, trackers: list[str]) -> None:
         """
@@ -146,13 +163,15 @@ class I2P:
             return
         self._rpc("torrent-remove", {"ids": [tid], "delete-local-data": False})
 
-    def check_neighbours(self, id: str):
+    def check_neighbors(self, storage_id: str) -> dict[str, str]:
         """
-        Get all neighbours on a specific torrent.
-        Returns a dictionary of their public key IDs and their at risk list.
-        Auto filters our users who fail the public key check.
+        Neighbor discovery for the torrent identified by ``storage_id`` (same id as ``storage.id`` /
+        I2P torrent id). Return a map of neighbor public-key id (hex string) to their latest
+        broadcast payload (typically a JSON string of at-risk file entries). **Stub:** empty map
+        until wired.
         """
-        pass
+        del storage_id
+        return {}
 
     def update_broadcast(self, message: str) -> None:
         """Updates the broadcast to whatever message is provided.

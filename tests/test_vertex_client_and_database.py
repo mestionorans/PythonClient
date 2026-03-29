@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -244,8 +245,10 @@ def test_neighbors_trust_levels_and_get(tmp_path: Path) -> None:
     row = db_setup.neighbor_get(conn, p)
     assert row["trust"] == 1
     assert row["times_found"] == 0
+    assert row["penalties"] == 0
     db_setup.neighbor_upsert(conn, p, -1, 0)
     assert db_setup.neighbor_get(conn, p)["trust"] == -1
+    assert db_setup.neighbor_get(conn, p)["penalties"] == 0
     conn.close()
 
 
@@ -286,10 +289,58 @@ def test_neighbor_upsert_none_times_preserves_existing(tmp_path: Path) -> None:
     conn = db_setup.connect(db)
     db_setup.init_schema(conn)
     p = _pk(1)
-    db_setup.neighbor_upsert(conn, p, 1, 7)
-    db_setup.neighbor_upsert(conn, p, 0, None)
+    db_setup.neighbor_upsert(conn, p, 1, 7, 3)
+    db_setup.neighbor_upsert(conn, p, 0, None, None)
     assert db_setup.neighbor_get(conn, p)["times_found"] == 7
     assert db_setup.neighbor_get(conn, p)["trust"] == 0
+    assert db_setup.neighbor_get(conn, p)["penalties"] == 3
+    conn.close()
+
+
+def test_neighbor_increment_penalties(tmp_path: Path) -> None:
+    db = tmp_path / "n.sqlite"
+    conn = db_setup.connect(db)
+    db_setup.init_schema(conn)
+    p = _pk(1)
+    db_setup.neighbor_upsert(conn, p, 1, 0, 3)
+    assert db_setup.neighbor_increment_penalties(conn, p) == 4
+    assert db_setup.neighbor_get(conn, p)["penalties"] == 4
+    conn.close()
+
+
+def test_neighbor_increment_times_preserves_penalties(tmp_path: Path) -> None:
+    db = tmp_path / "n.sqlite"
+    conn = db_setup.connect(db)
+    db_setup.init_schema(conn)
+    p = _pk(1)
+    db_setup.neighbor_upsert(conn, p, 1, 0, 4)
+    db_setup.neighbor_increment_times(conn, p)
+    assert db_setup.neighbor_get(conn, p)["penalties"] == 4
+    assert db_setup.neighbor_get(conn, p)["times_found"] == 1
+
+
+def test_neighbors_migrates_penalties_on_legacy_db(tmp_path: Path) -> None:
+    db = tmp_path / "legacy_n.sqlite"
+    raw = sqlite3.connect(db)
+    raw.execute(
+        """
+        CREATE TABLE neighbors (
+            public_key TEXT PRIMARY KEY,
+            trust INTEGER NOT NULL,
+            times_found INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    raw.execute("INSERT INTO neighbors(public_key, trust, times_found) VALUES(?, 0, 2)", (_pk(9),))
+    raw.commit()
+    raw.close()
+
+    conn = db_setup.connect(db)
+    db_setup.init_schema(conn)
+    row = db_setup.neighbor_get(conn, _pk(9))
+    assert row is not None
+    assert row["penalties"] == 0
+    assert row["times_found"] == 2
     conn.close()
 
 
@@ -353,6 +404,8 @@ def test_full_workflow_init_then_tables(tmp_path: Path) -> None:
 def test_signup_sets_node_address_and_merges_node_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from unittest.mock import MagicMock
+
     def fake_get(addr: str) -> dict:
         assert addr == "https://node/"
         return {
@@ -366,9 +419,9 @@ def test_signup_sets_node_address_and_merges_node_config(
         }
 
     monkeypatch.setattr("vertex.client.NodeParser.get_config", fake_get)
-    c = VertexClient(tmp_path / "vd")
+    c = VertexClient(tmp_path / "vd", i2p=MagicMock())
     try:
-        c.signup("https://node/")
+        c.signup("https://node/", DEFAULT_CONFIG["Total_Storage"])
         assert c.config["NodeAddress"] == "https://node/"
         assert c.config["Swappiness"] == 0.99
         assert c.config["TrustedTracker"] == ["tr1"]
@@ -387,7 +440,20 @@ def test_signup_sets_node_address_and_merges_node_config(
         c.close()
 
 
-def test_signup_calls_i2p_download_when_wired(
+def test_signup_starting_total_storage_sets_quotas(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    total = 5 * 1024 * 1024 * 1024
+    c = VertexClient(tmp_path / "vd", i2p=MagicMock())
+    try:
+        c.signup("https://example/", total)
+        assert c.config["Total_Storage"] == total
+        assert c.states["CurrentTotalStorage"] == total
+    finally:
+        c.close()
+
+
+def test_signup_calls_i2p_add_torrent_when_wired(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from unittest.mock import MagicMock
@@ -405,8 +471,8 @@ def test_signup_calls_i2p_download_when_wired(
     monkeypatch.setattr("vertex.client.NodeParser.get_init_files", fake_init)
     c = VertexClient(tmp_path / "vd", i2p=i2p)
     try:
-        c.signup("n")
-        assert i2p.download_file.call_count == 4
+        c.signup("n", DEFAULT_CONFIG["Total_Storage"])
+        assert i2p.add_torrent.call_count == 4
         rows = db_setup.storage_list(c._connection)
         assert len(rows) == 4
         assert {r["id"] for r in rows} == {"only-1-x", "only-1-y", "only-2-x", "only-2-y"}
@@ -426,10 +492,10 @@ def test_update_metadata_refreshes_storage_rows(
 ) -> None:
     calls: list[str] = []
 
-    def fake_fetch(fid: str) -> tuple[dict, int, int]:
+    def fake_fetch(fid: str) -> tuple[dict, int, int, int]:
         calls.append(fid)
         n = len(calls)
-        return ({"rev": n}, n * 10, n * 1000)
+        return ({"rev": n}, n * 10, n * 1000, 99)
 
     monkeypatch.setattr("vertex.client.NodeParser.fetch_metadata", fake_fetch)
     c = VertexClient(tmp_path / "vd")
@@ -475,15 +541,184 @@ def test_get_health_uses_storage_priority(tmp_path: Path) -> None:
     from unittest.mock import MagicMock
 
     i2p = MagicMock()
+    i2p.is_seeding.return_value = True
     i2p.count_seeders.return_value = 5
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        db_setup.storage_insert(
+            c._connection, "fx", "general/x", None, priority=7, size=123
+        )
+        h, _size = c.get_health("fx")
+        assert h == health_equation(7, 5, DEFAULT_CONFIG["Priority_Weights"])
+        assert _size == 123
+        i2p.is_seeding.assert_called_once_with("fx")
+        i2p.count_seeders.assert_called_once_with("fx", [])
+    finally:
+        c.close()
+
+
+def test_get_health_uses_metadata_seeders_when_not_seeding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    i2p = MagicMock()
+    i2p.is_seeding.return_value = False
+
+    def fake_fetch(tid: str) -> tuple[dict, int, int, int]:
+        assert tid == "fx"
+        return ({}, 0, 1000, 8)
+
+    monkeypatch.setattr("vertex.client.NodeParser.fetch_metadata", fake_fetch)
     c = VertexClient(tmp_path / "vd", i2p=i2p)
     try:
         db_setup.storage_insert(
             c._connection, "fx", "general/x", None, priority=7
         )
-        h = c.get_health("fx")
-        assert h == health_equation(7, 5, DEFAULT_CONFIG["Priority_Weights"])
-        i2p.count_seeders.assert_called_once_with("fx", [])
+        h, _size = c.get_health("fx")
+        assert h == health_equation(7, 8, DEFAULT_CONFIG["Priority_Weights"])
+        assert _size == 1000
+        i2p.count_seeders.assert_not_called()
+    finally:
+        c.close()
+
+
+# --- check_neighbors ---
+
+_HEALTH_IND_SEED_ID = "health-ind-seed"
+
+
+def _insert_health_ind_seeding_row(c: VertexClient, i2p: Any, seed_id: str = _HEALTH_IND_SEED_ID) -> None:
+    """Storage row under ``health_ind/`` and ``i2p.is_seeding`` true so :meth:`check_neighbors` runs."""
+    i2p.is_seeding.return_value = True
+    db_setup.storage_insert(c._connection, seed_id, f"health_ind/{seed_id}", None)
+
+
+def test_check_neighbors_no_seeding_candidate_skips_i2p(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    i2p = MagicMock()
+    i2p.is_seeding.return_value = False
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        db_setup.storage_insert(
+            c._connection, "x", "health_ind/x", None
+        )
+        c.check_neighbors()
+        i2p.check_neighbors.assert_not_called()
+    finally:
+        c.close()
+
+
+def test_check_neighbors_skips_banned(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    pk = _pk(1)
+    i2p = MagicMock()
+    i2p.check_neighbors.return_value = {pk: "[]"}
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        _insert_health_ind_seeding_row(c, i2p)
+        db_setup.neighbor_upsert(c._connection, pk, -1, 0, 0)
+        c.check_neighbors()
+        i2p.check_neighbors.assert_called_once_with(_HEALTH_IND_SEED_ID)
+        assert db_setup.neighbor_get(c._connection, pk)["times_found"] == 0
+    finally:
+        c.close()
+
+
+def test_check_neighbors_promotes_pending_when_times_exceeds_trust_quickness(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    pk = _pk(2)
+    i2p = MagicMock()
+    i2p.check_neighbors.return_value = {pk: "[]"}
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        _insert_health_ind_seeding_row(c, i2p)
+        c.change_parameter("TrustQuickness", 1.0)
+        c.check_neighbors()
+        assert db_setup.neighbor_get(c._connection, pk)["times_found"] == 1
+        assert db_setup.neighbor_get(c._connection, pk)["trust"] == 0
+        c.check_neighbors()
+        row = db_setup.neighbor_get(c._connection, pk)
+        assert row["times_found"] == 2
+        assert row["trust"] == 1
+        assert i2p.check_neighbors.call_count == 2
+        assert [ca.args[0] for ca in i2p.check_neighbors.call_args_list] == [
+            _HEALTH_IND_SEED_ID,
+            _HEALTH_IND_SEED_ID,
+        ]
+    finally:
+        c.close()
+
+
+def test_check_neighbors_unhealthy_broadcast_upserts_unhealth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.1, 42))
+    pk = _pk(3)
+    tid = "torrent-unhealthy-1"
+    i2p = MagicMock()
+    i2p.check_neighbors.return_value = {
+        pk: json.dumps([{"id": tid, "size": 999}])
+    }
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        _insert_health_ind_seeding_row(c, i2p)
+        db_setup.neighbor_upsert(c._connection, pk, 1, 5, 0)
+        db_setup.storage_insert(c._connection, tid, "general/x", None, priority=7, size=100)
+        c.check_neighbors()
+        row = db_setup.unhealth_get(c._connection, tid)
+        assert row is not None
+        assert row["size"] == 42
+    finally:
+        c.close()
+
+
+def test_check_neighbors_healthy_broadcast_increments_penalties(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.9, 100))
+    pk = _pk(4)
+    tid = "torrent-healthy-1"
+    i2p = MagicMock()
+    i2p.check_neighbors.return_value = {pk: json.dumps([{"id": tid}])}
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        _insert_health_ind_seeding_row(c, i2p)
+        db_setup.neighbor_upsert(c._connection, pk, 1, 5, 0)
+        db_setup.storage_insert(c._connection, tid, "general/x", None, priority=7, size=100)
+        c.check_neighbors()
+        assert db_setup.neighbor_get(c._connection, pk)["penalties"] == 1
+    finally:
+        c.close()
+
+
+def test_check_neighbors_healthy_bans_when_penalty_over_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.9, 100))
+    pk = _pk(5)
+    tid = "torrent-ban-1"
+    i2p = MagicMock()
+    i2p.check_neighbors.return_value = {pk: json.dumps([{"id": tid}] * 11)}
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        _insert_health_ind_seeding_row(c, i2p)
+        c.change_parameter("Penalty_Limit", 10)
+        db_setup.neighbor_upsert(c._connection, pk, 1, 5, 0)
+        db_setup.storage_insert(c._connection, tid, "general/x", None, priority=7, size=100)
+        c.check_neighbors()
+        assert db_setup.neighbor_get(c._connection, pk)["trust"] == -1
     finally:
         c.close()
 
@@ -505,7 +740,7 @@ def test_get_health_raises_when_torrent_not_in_storage(tmp_path: Path) -> None:
 def test_update_atrisk_list_removes_when_health_at_or_above_threshold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.9)
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.9, 0))
     c = VertexClient(tmp_path / "vd")
     try:
         db_setup.storage_insert(c._connection, "tx", "general/x", None)
@@ -519,7 +754,7 @@ def test_update_atrisk_list_removes_when_health_at_or_above_threshold(
 def test_update_atrisk_list_keeps_unhealth_when_below_threshold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.1)
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.1, 0))
     c = VertexClient(tmp_path / "vd")
     try:
         # Size must match storage: update_atrisk_list upserts unhealth from storage.size.
@@ -537,7 +772,7 @@ def test_update_atrisk_list_keeps_unhealth_when_below_threshold(
 def test_update_atrisk_list_adds_storage_rows_when_unhealthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.1)
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.1, 0))
     c = VertexClient(tmp_path / "vd")
     try:
         db_setup.storage_insert(
@@ -554,7 +789,7 @@ def test_update_atrisk_list_adds_storage_rows_when_unhealthy(
 def test_update_atrisk_list_skips_storage_when_healthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: 0.9)
+    monkeypatch.setattr(VertexClient, "get_health", lambda self, tid: (0.9, 0))
     c = VertexClient(tmp_path / "vd")
     try:
         db_setup.storage_insert(
@@ -562,5 +797,112 @@ def test_update_atrisk_list_skips_storage_when_healthy(
         )
         c.update_atrisk_list()
         assert db_setup.unhealth_get(c._connection, "tf") is None
+    finally:
+        c.close()
+
+
+# --- backup_engine ---
+
+
+def test_backup_engine_swappiness_skips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr("vertex.client.random.random", lambda: 0.0)
+
+    c = VertexClient(tmp_path / "vd", i2p=MagicMock())
+    try:
+        c.backup_engine()
+    finally:
+        c.close()
+
+
+def test_backup_engine_moves_unhealth_from_general_to_emergency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr("vertex.client.random.random", lambda: 0.99)
+
+    i2p = MagicMock()
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        fid = "t-backup-1"
+        gpath = tmp_path / "vd" / "general" / fid
+        gpath.write_bytes(b"y" * 40)
+        db_setup.storage_insert(c._connection, fid, f"general/{fid}", None, size=40)
+        db_setup.unhealth_upsert(c._connection, fid, 40)
+        c.backup_engine()
+        assert (tmp_path / "vd" / "emergency" / fid).is_file()
+        assert db_setup.storage_get(c._connection, fid)["file_location"] == f"emergency/{fid}"
+        epath = tmp_path / "vd" / "emergency" / fid
+        i2p.delete_torrent.assert_called_once_with(str(gpath), fid)
+        i2p.add_torrent.assert_called_once_with(str(epath), fid, [])
+    finally:
+        c.close()
+
+
+def test_backup_engine_evacuates_emergency_to_general_when_over_90_percent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr("vertex.client.random.random", lambda: 0.99)
+
+    i2p = MagicMock()
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        c.change_parameter("Total_Storage", 1000)
+        eid = "e1"
+        epath = tmp_path / "vd" / "emergency" / eid
+        epath.write_bytes(b"z" * 95)
+        db_setup.storage_insert(c._connection, eid, f"emergency/{eid}", None, size=95)
+        c.update_states()
+        total_e = int(c.states["Current_Total_Emergency_Storage"] or 0)
+        used_e = int(c.states["Current_Used_Total_Emergency_Storage"] or 0)
+        assert total_e == 100
+        assert used_e == 95
+        assert used_e > total_e * 0.9
+        c.backup_engine()
+        assert not epath.exists()
+        gpath = tmp_path / "vd" / "general" / eid
+        assert gpath.is_file()
+        assert db_setup.storage_get(c._connection, eid)["file_location"] == f"general/{eid}"
+        i2p.delete_torrent.assert_called_once_with(str(epath), eid)
+        i2p.add_torrent.assert_called_once_with(str(gpath), eid, [])
+    finally:
+        c.close()
+
+
+def test_drop_general_row_deletes_storage_before_delete_torrent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    order: list[str] = []
+    orig_sd = db_setup.storage_delete
+
+    def wrap_storage_delete(conn: sqlite3.Connection, tid: str) -> None:
+        order.append("storage_delete")
+        orig_sd(conn, tid)
+
+    monkeypatch.setattr("vertex.client._db.storage_delete", wrap_storage_delete)
+
+    i2p = MagicMock()
+
+    def track_delete(_path_str: str, _tid: str) -> None:
+        order.append("delete_torrent")
+
+    i2p.delete_torrent.side_effect = track_delete
+
+    c = VertexClient(tmp_path / "vd", i2p=i2p)
+    try:
+        tid = "drop-order-1"
+        (tmp_path / "vd" / "general" / tid).write_bytes(b"x")
+        db_setup.storage_insert(c._connection, tid, f"general/{tid}", None, size=1)
+        row = db_setup.storage_get(c._connection, tid)
+        assert row is not None
+        c._drop_general_row(dict(row))
+        assert order == ["storage_delete", "delete_torrent"]
+        assert db_setup.storage_get(c._connection, tid) is None
     finally:
         c.close()

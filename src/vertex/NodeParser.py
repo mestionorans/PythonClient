@@ -19,7 +19,7 @@ def get_config(node_address: str) -> dict[str, Any]:
     Expected real fields: ``Health_Ind_Storage_Perc``, ``Emergency_Storage_Perc``, ``Swappiness``,
     ``TrustQuickness``, ``Timer_Interval_Hours``, ``TrustedTracker`` (list; replaces
     ``TrustedTrackerList`` from the wire), ``Unhealth_Index``, ``Priority_Weights`` (object mapping
-    priority level to weight).
+    priority level to weight), ``Penalty_Limit`` (max penalties before a neighbor is banned).
     """
     del node_address
     return {
@@ -30,6 +30,7 @@ def get_config(node_address: str) -> dict[str, Any]:
         "TrustedTracker": ["testtracker1.com"],
         "Unhealth_Index": 0.5,
         "Priority_Weights": {0: 1, 1: 2, 2: 3},
+        "Penalty_Limit": 10,
     }
 
 
@@ -48,13 +49,16 @@ def get_init_files(remaining_size_bytes: int) -> list[str]:
     return [f"stub-{w}-a", f"stub-{w}-b"]
 
 
-def fetch_metadata(torrent_id: str) -> tuple[dict[str, Any], int, int]:
+def fetch_metadata(torrent_id: str) -> tuple[dict[str, Any], int, int, int]:
     """
-    Return ``(metadata, priority, size_bytes)`` for the torrent file ``torrent_id`` (same as
+    Return ``(metadata, priority, size_bytes, seeders)`` for the torrent file ``torrent_id`` (same as
     ``storage.id`` and the id passed to I2P). ``metadata`` is merged into the row's JSON;
     ``priority`` updates ``storage.priority``; ``size_bytes`` updates ``storage.size``.
+
+    The ``seeders`` count is for health when the torrent is **not** being seeded locally (see
+    :meth:`vertex.client.VertexClient.get_health`); it is not persisted by :meth:`vertex.client.VertexClient.update_metadata`.
 
     **Stub:** Ignores ``torrent_id`` and returns fixed values for local testing.
     """
     del torrent_id
-    return {"stub_meta": True}, 0, 1024
+    return {"stub_meta": True}, 0, 1024, 0

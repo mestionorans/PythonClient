@@ -20,7 +20,8 @@ Vertex client — ``config`` (SQLite ``config_kv``), ``states`` (runtime counter
 
     ``Swappiness``
         How aggressively to trade non-emergency data for emergency room when under pressure
-        (typically 0.0–1.0).
+        (typically 0.0–1.0). Also the probability that :meth:`VertexClient.backup_engine` does
+        nothing on a given run.
 
     ``TrustQuickness``
         How fast trust / neighbor policy reacts (application-defined scale).
@@ -44,6 +45,10 @@ Vertex client — ``config`` (SQLite ``config_kv``), ``states`` (runtime counter
         Map from priority level (integer, as key) to weight (integer), used when combining or
         ranking by tier priority. Persisted as JSON object (keys may load back as strings).
 
+    ``Penalty_Limit``
+        Maximum neighbor ``penalties`` before trust is set to banned (``-1``); see
+        :meth:`VertexClient.check_neighbors`.
+
     Unknown keys may still be stored. :meth:`VertexClient.change_parameter` upserts one key;
     defaults are merged on load; on first run, defaults are written to the DB if the table was empty.
 
@@ -65,6 +70,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import shutil
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -82,6 +89,7 @@ _DB_NAME = "vertex.sqlite"
 _SUB_EMERGENCY = "emergency"
 _SUB_HEALTH_IND = "health_ind"
 _SUB_GENERAL = "general"
+_AT_RISK_BROADCAST_MAX_ENTRIES = 100
 
 # Changing these affects quota totals; :meth:`change_parameter` will rerun :meth:`update_states`.
 _CONFIG_KEYS_AFFECTING_QUOTAS = frozenset(
@@ -100,6 +108,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "Total_Storage": 10 * 1024 * 1024 * 1024,
     "Unhealth_Index": 0.5,
     "Priority_Weights": {0: 1, 1: 2, 2: 3},
+    "Penalty_Limit": 10,
 }
 
 
@@ -196,6 +205,10 @@ class VertexClient:
         if key in _CONFIG_KEYS_AFFECTING_QUOTAS:
             self.update_states()
 
+    def _trusted_trackers(self) -> list[str]:
+        trackers_raw = self.config.get("TrustedTracker") or []
+        return [str(t) for t in trackers_raw if t is not None]
+
     def update_states(self) -> None:
         """
         Recompute ``states`` from ``config`` (quota totals) and disk usage under each tier folder.
@@ -230,7 +243,8 @@ class VertexClient:
         For each row in ``storage``, normalize ``metadata`` to a dict (empty if missing, invalid
         JSON, or non-object JSON), call :func:`vertex.NodeParser.fetch_metadata` with the torrent
         file ``id`` (same id used for download), merge the returned metadata dict into the JSON,
-        and persist ``metadata``, ``priority``, and ``size`` (bytes).
+        and persist ``metadata``, ``priority``, and ``size`` (bytes). The fourth return value from
+        ``fetch_metadata`` (seeders) is not read for persistence here.
         """
         for row in _db.storage_list(self._conn):
             raw = row.get("metadata")
@@ -245,29 +259,43 @@ class VertexClient:
                 else:
                     meta = parsed if isinstance(parsed, dict) else {}
             tid = str(row["id"])
-            remote_meta, priority, size_b = NodeParser.fetch_metadata(tid)
+            remote_meta, priority, size_b, _ = NodeParser.fetch_metadata(tid)
             merged = {**meta, **remote_meta}
             _db.storage_update_metadata(self._conn, tid, json.dumps(merged))
             _db.storage_update_priority(self._conn, tid, int(priority))
             _db.storage_update_size(self._conn, tid, int(size_b))
 
-    def get_health(self, torrent_id: str) -> float:
+    def get_health(self, torrent_id: str) -> tuple[float, int]:
         """
-        Health score for the torrent file ``torrent_id`` (the ``storage.id`` and I2P download id).
-        Seeder count from :meth:`vertex.i2p.I2P.count_seeders`; priority from the ``storage`` row;
-        ``Priority_Weights`` from ``config``; combined via :func:`vertex.health.health_equation`.
+        Return ``(health_score, size_bytes)`` for the torrent file ``torrent_id`` (the ``storage.id``
+        and I2P download id).
+
+        If :meth:`vertex.i2p.I2P.is_seeding` is true (torrent is on this device and seeding), the
+        seeder count comes from :meth:`vertex.i2p.I2P.count_seeders` and ``size_bytes`` is
+        ``storage.size``. Otherwise seeders and ``size_bytes`` come from a single call to
+        :func:`vertex.NodeParser.fetch_metadata` (fourth and third return values respectively), so
+        sizes reflect the node when the file is not present locally as an active seed.
+
+        Priority from the ``storage`` row and ``Priority_Weights`` from ``config`` are combined via
+        :func:`vertex.health.health_equation`.
 
         Raises ``KeyError`` if there is no ``storage`` row for ``torrent_id``.
         """
         row = _db.storage_get(self._conn, torrent_id)
         if row is None:
             raise KeyError(torrent_id)
-        trackers_raw = self.config.get("TrustedTracker") or []
-        trackers = [str(t) for t in trackers_raw if t is not None]
-        seeders = self._i2p.count_seeders(torrent_id, trackers)
+        trackers = self._trusted_trackers()
+        if self._i2p.is_seeding(torrent_id):
+            seeders = int(self._i2p.count_seeders(torrent_id, trackers))
+            size_bytes = int(row["size"])
+        else:
+            _m, _p, size_b, seeders_meta = NodeParser.fetch_metadata(torrent_id)
+            seeders = int(seeders_meta)
+            size_bytes = int(size_b)
         priority = float(row["priority"])
         weights = self.config.get("Priority_Weights") or {}
-        return health_equation(priority, int(seeders), weights)
+        score = health_equation(priority, seeders, weights)
+        return score, size_bytes
 
     def update_atrisk_list(self) -> None:
         """
@@ -280,21 +308,147 @@ class VertexClient:
         threshold = float(self.config.get("Unhealth_Index", 0.5))
 
         for tid in [str(r["id"]) for r in _db.unhealth_list(self._conn)]:
-            if self.get_health(tid) >= threshold:
+            h, _ = self.get_health(tid)
+            if h >= threshold:
                 _db.unhealth_delete(self._conn, tid)
 
         for row in _db.storage_list(self._conn):
             tid = str(row["id"])
-            if self.get_health(tid) < threshold:
+            h, _ = self.get_health(tid)
+            if h < threshold:
                 _db.unhealth_upsert(self._conn, tid, int(row["size"]))
 
-    def signup(self, node_address: str) -> None:
+    def broadcast_at_risk(self) -> None:
+        """
+        Take at most the first 100 rows from ``unhealth`` (see module constant
+        ``_AT_RISK_BROADCAST_MAX_ENTRIES``), encode them as a JSON array string
+        ``[{"id": ..., "size": ...}, ...]``, and pass it to
+        :meth:`vertex.i2p.I2P.update_broadcast`.
+        """
+        rows = _db.unhealth_list(self._conn)[:_AT_RISK_BROADCAST_MAX_ENTRIES]
+        payload = json.dumps(
+            [{"id": str(r["id"]), "size": int(r["size"])} for r in rows]
+        )
+        self._i2p.update_broadcast(payload)
+
+    def _random_health_ind_seeding_storage_id(self) -> str | None:
+        """
+        Pick a random ``storage.id`` whose ``file_location`` is under the health-ind tier and that
+        :meth:`vertex.i2p.I2P.is_seeding` reports as seeding locally. ``None`` if there is no such row.
+        """
+        prefix = f"{_SUB_HEALTH_IND}/"
+        candidates: list[str] = []
+        for row in _db.storage_list(self._conn):
+            if not str(row.get("file_location", "")).startswith(prefix):
+                continue
+            tid = str(row["id"])
+            if self._i2p.is_seeding(tid):
+                candidates.append(tid)
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def check_neighbors(self) -> None:
+        """
+        Choose a random health-tier torrent id that is in ``storage`` and seeding locally, then call
+        :meth:`vertex.i2p.I2P.check_neighbors` with that id. If none qualify, return without doing
+        anything. Otherwise reconcile trust and penalties in ``neighbors``, and update ``unhealth``
+        from broadcast file ids.
+
+        Pending neighbors (``trust`` 0) get ``times_found`` incremented each time they appear; when
+        ``times_found`` exceeds ``TrustQuickness`` they become trusted (1). Banned (-1) neighbors
+        are skipped.
+
+        For trusted neighbors, the broadcast string is parsed as JSON (same shape as
+        :meth:`broadcast_at_risk`: a list of ``{"id", "size"}`` objects). For each id that exists in
+        ``storage``, :meth:`get_health` runs. If the score is **at or above** ``Unhealth_Index`` the
+        neighbor is penalized; if ``penalties`` exceeds ``Penalty_Limit`` they are banned. If the
+        score is **below** ``Unhealth_Index``, the torrent id is upserted into ``unhealth`` using the
+        second value from :meth:`get_health` as size.
+        """
+        storage_id = self._random_health_ind_seeding_storage_id()
+        if storage_id is None:
+            return
+        broadcasts = self._i2p.check_neighbors(storage_id)
+        tq = float(self.config.get("TrustQuickness", 1.0))
+        threshold = float(self.config.get("Unhealth_Index", 0.5))
+        penalty_limit = int(self.config.get("Penalty_Limit", 10))
+
+        for public_key, _msg in broadcasts.items():
+            row = _db.neighbor_get(self._conn, public_key)
+            if row is None:
+                _db.neighbor_upsert(self._conn, public_key, 0, 0, 0)
+                row = _db.neighbor_get(self._conn, public_key)
+            if row is None:
+                continue
+            trust = int(row["trust"])
+            if trust == -1:
+                continue
+            if trust == 0:
+                _db.neighbor_increment_times(self._conn, public_key)
+                row = _db.neighbor_get(self._conn, public_key)
+                if row is not None and float(row["times_found"]) > tq:
+                    _db.neighbor_upsert(
+                        self._conn,
+                        public_key,
+                        1,
+                        int(row["times_found"]),
+                        int(row["penalties"]),
+                    )
+
+        for public_key, message in broadcasts.items():
+            row = _db.neighbor_get(self._conn, public_key)
+            if row is None or int(row["trust"]) != 1:
+                continue
+            if not (message or "").strip():
+                entries: list[Any] = []
+            else:
+                try:
+                    parsed = json.loads(message)
+                except json.JSONDecodeError:
+                    parsed = []
+                entries = parsed if isinstance(parsed, list) else []
+
+            for item in entries:
+                row = _db.neighbor_get(self._conn, public_key)
+                if row is None or int(row["trust"]) != 1:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                tid = str(item.get("id", ""))
+                if not tid:
+                    continue
+                if _db.storage_get(self._conn, tid) is None:
+                    continue
+                try:
+                    h, sz = self.get_health(tid)
+                except KeyError:
+                    continue
+                if h >= threshold:
+                    p = _db.neighbor_increment_penalties(self._conn, public_key)
+                    if p > penalty_limit:
+                        row = _db.neighbor_get(self._conn, public_key)
+                        if row is not None:
+                            _db.neighbor_upsert(
+                                self._conn,
+                                public_key,
+                                -1,
+                                int(row["times_found"]),
+                                int(row["penalties"]),
+                            )
+                        break
+                else:
+                    _db.unhealth_upsert(self._conn, tid, int(sz))
+
+    def signup(self, node_address: str, starting_total_storage: int) -> None:
         """
         Subscribe to ``node_address``: persist it, pull node tunables via :func:`vertex.NodeParser.get_config`,
-        merge into ``config``, refresh ``states``, then request initial file ids per tier. For each
-        torrent id it calls :meth:`vertex.i2p.I2P.download_file` on ``self._i2p`` and inserts a
-        ``storage`` row whose ``id`` is that torrent id and ``file_location`` is
-        ``<tier>/<torrent_id>``; ``size`` is filled by :meth:`update_metadata` from the node.
+        merge into ``config``, set ``Total_Storage`` to ``starting_total_storage`` (bytes) so the first
+        quota refresh matches local capacity before any later :meth:`change_parameter` calls, then
+        refresh ``states``, then request initial file ids per tier. For each torrent id it calls
+        :meth:`vertex.i2p.I2P.add_torrent` on ``self._i2p`` (so the torrent client registers the
+        magnet) and inserts a ``storage`` row whose ``id`` is that torrent id and ``file_location``
+        is ``<tier>/<torrent_id>``; ``size`` is filled by :meth:`update_metadata` from the node.
         """
         self.change_parameter("NodeAddress", node_address)
 
@@ -302,7 +456,7 @@ class VertexClient:
         for key, value in remote.items():
             self.config[key] = value
             _db.config_set(self._conn, key, value)
-        self.update_states()
+        self.change_parameter("Total_Storage", int(starting_total_storage))
 
         total_g = int(self.states["Current_Total_General_Storage"] or 0)
         used_g = int(self.states["Current_Used_Total_General_Storage"] or 0)
@@ -314,17 +468,16 @@ class VertexClient:
         general_ids = NodeParser.get_init_files(remaining_general)
         health_ids = NodeParser.get_init_files(remaining_health_ind)
 
-        trackers_raw = self.config.get("TrustedTracker") or []
-        trackers = [str(t) for t in trackers_raw if t is not None]
+        trackers = self._trusted_trackers()
 
         for fid in general_ids:
             dest = str(self._general_dir / fid)
-            self._i2p.download_file(dest, fid, trackers)
+            self._i2p.add_torrent(dest, fid, trackers)
             loc = _storage_file_location(_SUB_GENERAL, fid)
             _db.storage_insert(self._conn, fid, loc, None)
         for fid in health_ids:
             dest = str(self._health_ind_dir / fid)
-            self._i2p.download_file(dest, fid, trackers)
+            self._i2p.add_torrent(dest, fid, trackers)
             loc = _storage_file_location(_SUB_HEALTH_IND, fid)
             _db.storage_insert(self._conn, fid, loc, None)
 
@@ -346,7 +499,148 @@ class VertexClient:
 
     def on_timer(self) -> None:
         self.update_atrisk_list()
-        
+        self.check_neighbors()
+        self.broadcast_at_risk()
+        self.backup_engine()
+
+    def backup_engine(self) -> None:
+        """
+        Emergency backup: with probability ``Swappiness``, do nothing. Otherwise move one ``unhealth``
+        item from ``general/`` or ``health_ind/`` into ``emergency/`` if it fits the remaining
+        emergency quota (file move, then :meth:`~vertex.i2p.I2P.delete_torrent` on the old path,
+        then :meth:`~vertex.i2p.I2P.add_torrent` on the new path, then update ``storage``). If
+        emergency usage exceeds 90% of its quota, drop healthy ``general/`` files (lowest priority
+        first) until general free space is at least the used emergency bytes — each drop removes
+        SQLite rows and local data first, then :meth:`~vertex.i2p.I2P.delete_torrent` — then move
+        each ``emergency/`` file to ``general/`` using the same move → ``delete_torrent`` (old) →
+        ``add_torrent`` (new) sequence.
+        """
+        self.update_states()
+        sw = float(self.config.get("Swappiness", 0.5))
+        sw = max(0.0, min(1.0, sw))
+        if random.random() < sw:
+            return
+
+        self._try_backup_one_from_unhealth()
+        self.update_states()
+
+        total_e = int(self.states.get("Current_Total_Emergency_Storage") or 0)
+        used_e = int(self.states.get("Current_Used_Total_Emergency_Storage") or 0)
+        if total_e <= 0:
+            return
+        if used_e <= total_e * 0.9:
+            return
+
+        self._evacuate_emergency_via_general()
+        self.update_states()
+
+    def _try_backup_one_from_unhealth(self) -> None:
+        total_e = int(self.states.get("Current_Total_Emergency_Storage") or 0)
+        used_e = int(self.states.get("Current_Used_Total_Emergency_Storage") or 0)
+        free_e = max(0, total_e - used_e)
+        if free_e <= 0:
+            return
+
+        ep = f"{_SUB_EMERGENCY}/"
+        for urow in _db.unhealth_list(self._conn):
+            tid = str(urow["id"])
+            srow = _db.storage_get(self._conn, tid)
+            if srow is None:
+                continue
+            loc = str(srow.get("file_location", ""))
+            if loc.startswith(ep):
+                continue
+            if not (loc.startswith(f"{_SUB_GENERAL}/") or loc.startswith(f"{_SUB_HEALTH_IND}/")):
+                continue
+            need = int(srow.get("size") or 0)
+            if need <= 0:
+                need = int(urow.get("size") or 0)
+            if need > free_e:
+                continue
+
+            src = self._data_dir / loc
+            dst_loc = f"{_SUB_EMERGENCY}/{tid}"
+            dst = self._emergency_dir / tid
+            if not src.exists():
+                continue
+            old_path_str = str(src)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            self._i2p.delete_torrent(old_path_str, tid)
+            self._i2p.add_torrent(str(dst), tid, self._trusted_trackers())
+            _db.storage_update_file_location(self._conn, tid, dst_loc)
+            return
+
+    def _evacuate_emergency_via_general(self) -> None:
+        self.update_states()
+        threshold = float(self.config.get("Unhealth_Index", 0.5))
+        total_g = int(self.states.get("Current_Total_General_Storage") or 0)
+        used_g = int(self.states.get("Current_Used_Total_General_Storage") or 0)
+        used_e = int(self.states.get("Current_Used_Total_Emergency_Storage") or 0)
+        need_free = used_e
+
+        gp = f"{_SUB_GENERAL}/"
+        general_rows = [
+            r
+            for r in _db.storage_list(self._conn)
+            if str(r.get("file_location", "")).startswith(gp)
+        ]
+        general_rows.sort(key=lambda r: (int(r.get("priority") or 0), str(r["id"])))
+
+        free_g = max(0, total_g - used_g)
+        while free_g < need_free and general_rows:
+            row = general_rows.pop(0)
+            tid = str(row["id"])
+            try:
+                h, _ = self.get_health(tid)
+            except KeyError:
+                continue
+            if h < threshold:
+                continue
+            self._drop_general_row(row)
+            self.update_states()
+            total_g = int(self.states.get("Current_Total_General_Storage") or 0)
+            used_g = int(self.states.get("Current_Used_Total_General_Storage") or 0)
+            free_g = max(0, total_g - used_g)
+
+        if free_g < need_free:
+            return
+
+        ep = f"{_SUB_EMERGENCY}/"
+        emergency_rows = [
+            r
+            for r in _db.storage_list(self._conn)
+            if str(r.get("file_location", "")).startswith(ep)
+        ]
+        emergency_rows.sort(key=lambda r: str(r["id"]))
+
+        trackers = self._trusted_trackers()
+        for row in emergency_rows:
+            tid = str(row["id"])
+            loc = str(row["file_location"])
+            src = self._data_dir / loc
+            dst_loc = f"{_SUB_GENERAL}/{tid}"
+            dst = self._general_dir / tid
+            old_path_str = str(src)
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                self._i2p.delete_torrent(old_path_str, tid)
+                self._i2p.add_torrent(str(dst), tid, trackers)
+            _db.storage_update_file_location(self._conn, tid, dst_loc)
+
+    def _drop_general_row(self, row: dict) -> None:
+        tid = str(row["id"])
+        loc = str(row["file_location"])
+        path = self._data_dir / loc
+        path_str = str(path)
+        _db.unhealth_delete(self._conn, tid)
+        _db.storage_delete(self._conn, tid)
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        self._i2p.delete_torrent(path_str, tid)
 
 
 

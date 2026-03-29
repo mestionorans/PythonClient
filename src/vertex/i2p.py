@@ -9,6 +9,7 @@ import json
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -152,6 +153,24 @@ class I2P:
         magnet_uri = "&".join(magnet_parts)
 
         self._rpc("torrent-add", {"filename": magnet_uri})
+
+    def search(self, search_str: str, trackers: list[str]) -> dict[str, Any]:
+        """
+        Search for torrents: **in** — ``search_str``, ``trackers``; **out** — ``{id: metadata}``.
+
+        **Stub:** returns a fixed sample map (one entry) so UIs and :mod:`CLI` can be exercised;
+        echoes ``search_str`` and ``trackers`` in the metadata. Replace with real indexer /
+        network results when implemented.
+        """
+        sample_id = "deadbeefcafebabe0000deadbeefcafebabe0000"
+        return {
+            sample_id: {
+                "name": "[stub] Sample torrent title",
+                "stub": True,
+                "matched_query": search_str,
+                "trackers_filter": list(trackers),
+            }
+        }
 
     def delete_torrent(self, file_path: str, id: str) -> None:
         """

@@ -124,3 +124,15 @@ def test_count_seeders_unknown_id_no_rpc(monkeypatch, tmp_path):
 		n = client.count_seeders("not-a-valid-id")
 		assert n == 0
 		assert calls == []
+
+
+def test_search_stub_returns_sample_echoing_args(tmp_path):
+		client = I2P(tmp_path)
+		out = client.search("my query", ["http://t/"])
+		assert len(out) == 1
+		hid = "deadbeefcafebabe0000deadbeefcafebabe0000"
+		assert hid in out
+		meta = out[hid]
+		assert meta["stub"] is True
+		assert meta["matched_query"] == "my query"
+		assert meta["trackers_filter"] == ["http://t/"]

@@ -229,8 +229,11 @@ def fetch_metadata(torrent_id: str) -> tuple[dict[str, Any], int, int, int]:
     if isinstance(payload, dict) and tid:
         row = payload.get(tid)
         if row is None:
-            # Node keys include leading spaces in current JSON file.
-            row = payload.get(f" {tid}")
+            # Node keys can include stray whitespace in serialized JSON.
+            for k, v in payload.items():
+                if str(k).strip() == tid:
+                    row = v
+                    break
         if isinstance(row, dict):
             priority = _as_int(row.get("priority"), 0)
             seeders = _as_int(row.get("seeders"), 0)

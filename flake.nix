@@ -1,5 +1,5 @@
 {
-  description = "Vertex Python client — dev shell with Python + pip";
+  description = "Vertex Python client — dev shell with Python + pip (NiceGUI) ";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,6 +17,9 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
+            # Needed to build pydantic-core (NiceGUI dependency) from source
+            rustc
+            cargo
             (python3.withPackages (ps: with ps; [
               pip
               setuptools
@@ -25,9 +28,29 @@
           ];
 
           shellHook = ''
+            PYBIN="$(command -v python3 || true)"
+            if [ -z "$PYBIN" ]; then
+              PYBIN="$(command -v python || true)"
+            fi
+
+            if [ -z "$PYBIN" ]; then
+              echo "error: no python found in nix dev shell"
+              exit 1
+            fi
+
+            # Ensure the local venv exists and has NiceGUI installed.
+            if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import nicegui" >/dev/null 2>&1; then
+              echo "vertex-gui: creating/recreating .venv (missing nicegui)."
+              rm -rf .venv
+              "$PYBIN" -m venv .venv
+              . .venv/bin/activate
+              python -m pip install -U pip setuptools wheel
+              pip install -r requirements.txt
+              pip install -e '.[gui]'
+            fi
+
             echo "Vertex client — $(python --version)"
-            echo "  python -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'"
-            echo "  (or: pip install -r requirements-dev.txt && pip install -e .)"
+            echo "  GUI check: python -c \"import nicegui; print('nicegui ok')\""
           '';
         };
       });

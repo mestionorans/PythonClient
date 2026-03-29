@@ -1,4 +1,347 @@
 """
+``vertex-gui``: NiceGUI web UI for Vertex (glassy modern look).
+
+This GUI wraps your existing :mod:`CLI.app` commands:
+* `config show|get|set`
+* `download`
+* `search`
+* optional background daemon via `vertex-cli load|start` (log streaming + Stop)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from typing import Any
+
+from CLI.app import main as cli_main
+
+try:
+    from nicegui import ui  # type: ignore
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "NiceGUI is required for the web GUI. Install with `pip install -r requirements.txt` "
+        "or `pip install vertex-client[gui]`."
+    ) from e
+
+
+def _vertex_cli_argv() -> list[str]:
+    exe = shutil.which("vertex-cli")
+    if exe:
+        return [exe]
+    # Fallback for editable dev checkouts.
+    return [sys.executable, "-m", "CLI"]
+
+
+def _run_cli_capture(argv: list[str]) -> tuple[int, str]:
+    """
+    Run :func:`CLI.app.main` with captured output.
+
+    Returns `(exit_code, combined_text)`; stdout/stderr are combined for display.
+    """
+    out = io.StringIO()
+    err = io.StringIO()
+    code = 0
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            cli_main(argv)
+    except SystemExit as e:
+        if isinstance(e.code, int):
+            code = e.code
+        else:
+            code = 1
+    combined = out.getvalue()
+    if err.getvalue():
+        combined = (combined + "\n" + err.getvalue()).strip()
+    return code, combined.strip()
+
+
+def main() -> None:
+    # Global CSS for a "glassy" look.
+    ui.add_head_html(
+        """
+<style>
+  body {
+    background:
+      radial-gradient(1000px circle at 10% 10%, rgba(99,102,241,.35), transparent 45%),
+      radial-gradient(800px circle at 80% 30%, rgba(34,211,238,.20), transparent 40%),
+      radial-gradient(900px circle at 40% 90%, rgba(168,85,247,.18), transparent 45%),
+      linear-gradient(180deg, rgba(0,0,0,.65), rgba(0,0,0,.80));
+  }
+  .q-card, .q-dialog__inner, .q-expansion-item__content {
+    background: rgba(255,255,255,.06) !important;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,.14);
+    border-radius: 18px;
+  }
+  .q-input__control, .q-field, .q-field__control, .q-btn {
+    border-radius: 14px !important;
+  }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+  }
+</style>
+"""
+    )
+
+    log = ui.log(max_lines=4000).classes("mono")
+
+    # Daemon process state (optional background timer loop).
+    daemon_state: dict[str, Any] = {
+        "proc": None,
+        "queue": queue.Queue[str](),
+        "thread": None,
+    }
+
+    def _append_log_line(line: str) -> None:
+        line = line.rstrip("\n")
+        if not line:
+            return
+        log.push(line)
+
+    def _drain_daemon_queue() -> None:
+        q: queue.Queue[str] = daemon_state["queue"]
+        while True:
+            try:
+                line = q.get_nowait()
+            except queue.Empty:
+                break
+            _append_log_line(line)
+
+    ui.timer(0.2, _drain_daemon_queue)
+
+    async def _run_cli(argv: list[str], *, banner: str | None = None) -> None:
+        if banner:
+            log.push(banner)
+
+        code, text = await asyncio.to_thread(_run_cli_capture, argv)
+        if text:
+            # NiceGUI log handles multi-line strings as-is.
+            for part in text.splitlines():
+                _append_log_line(part)
+        log.push(f"[exit {code}]")
+
+    def _vertex_data_dir_from_ui(ui_value: str) -> str:
+        # CLI expects a filesystem path; we keep it permissive.
+        return ui_value.strip()
+
+    async def _daemon_start_load() -> None:
+        if daemon_state["proc"] is not None:
+            return
+        d = _vertex_data_dir_from_ui(data_dir.value)
+        if not d:
+            ui.notify("Enter node data directory first.", color="negative")
+            return
+        cmd = _vertex_cli_argv() + ["load", d]
+        _daemon_spawn(cmd)
+
+    async def _daemon_start_signup() -> None:
+        if daemon_state["proc"] is not None:
+            return
+        d = _vertex_data_dir_from_ui(data_dir.value)
+        addr = node_address.value.strip()
+        if not addr:
+            ui.notify("Enter node address for signup first.", color="negative")
+            return
+        try:
+            bytes_total = int(total_storage.value.strip())
+        except Exception:
+            ui.notify("Total storage must be an integer (bytes).", color="negative")
+            return
+        cmd = _vertex_cli_argv() + ["start", addr, d, str(bytes_total)]
+        if start_force.value:
+            cmd.append("--force")
+        _daemon_spawn(cmd)
+
+    def _daemon_spawn(cmd: list[str]) -> None:
+        log.push(f"starting daemon: {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            ui.notify(f"Failed to start daemon: {e}", color="negative")
+            return
+
+        daemon_state["proc"] = proc
+        daemon_state["thread"] = threading.Thread(
+            target=_daemon_reader_thread, args=(proc,), daemon=True
+        )
+        daemon_state["thread"].start()
+
+    def _daemon_reader_thread(proc: subprocess.Popen[str]) -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            daemon_state["queue"].put(line)
+        daemon_state["queue"].put("[daemon exited]")
+        daemon_state["proc"] = None
+
+    def _daemon_stop() -> None:
+        proc = daemon_state.get("proc")
+        if proc is None:
+            return
+        log.push("stopping daemon...")
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        daemon_state["proc"] = None
+        daemon_state["queue"].put("[daemon stopped]")
+
+    with ui.column().classes("w-full items-stretch q-gutter-y-md"):
+        ui.label("Vertex GUI").classes("text-h4 text-weight-bold")
+        ui.label("Actions run via your existing `vertex-cli`. Daemon mode streams logs here.").classes(
+            "text-subtitle1"
+        )
+
+        with ui.card().classes("q-pa-md"):
+            with ui.row().classes("q-col-gutter-md w-full"):
+                # Left side: controls.
+                with ui.column().classes("w-3/5 q-gutter-y-md"):
+                    data_dir = ui.input(
+                        label="Node data directory (contains vertex.sqlite)",
+                        placeholder=str(Path.home() / "vertex-node"),
+                        value=str(Path.home() / "vertex-node"),
+                    )
+
+                    with ui.expansion("Config"):
+                        cfg_key = ui.input(label="Key", placeholder="Swappiness")
+                        cfg_value = ui.input(
+                            label="Value (JSON or string)",
+                            placeholder='e.g. 0.5 or "hello world"',
+                        )
+                        with ui.row():
+                            ui.button(
+                                "Show config",
+                                on_click=lambda: _run_cli(
+                                    ["config", "-d", data_dir.value or "" , "show"],
+                                    banner="config show",
+                                ),
+                            )
+                            ui.button(
+                                "Get key",
+                                on_click=lambda: _run_cli(
+                                    ["config", "-d", data_dir.value or "" , "get", (cfg_key.value or "").strip()],
+                                    banner="config get",
+                                ),
+                            )
+                            ui.button(
+                                "Set key",
+                                on_click=lambda: _run_cli(
+                                    [
+                                        "config",
+                                        "-d",
+                                        data_dir.value or "",
+                                        "set",
+                                        (cfg_key.value or "").strip(),
+                                        cfg_value.value or "",
+                                    ],
+                                    banner="config set",
+                                ),
+                            )
+
+                    with ui.expansion("Download"):
+                        dl_torrent_id = ui.input(label="Torrent id / info-hash (40 hex or numeric)")
+                        dl_trackers = ui.textarea(
+                            label="Trackers (one per line, optional)",
+                            placeholder="http://tracker1/announce\nudp://tracker2/announce",
+                            rows=4,
+                        )
+                        ui.button(
+                            "Queue download",
+                            on_click=lambda: _download_action(
+                                dl_torrent_id.value or "",
+                                dl_trackers.value or "",
+                            ),
+                        )
+
+                    with ui.expansion("Search"):
+                        sr_query = ui.input(label="Query (stub returns sample JSON)")
+                        sr_trackers = ui.textarea(
+                            label="Tracker filters (one per line, optional)",
+                            placeholder="http://tracker/announce",
+                            rows=3,
+                        )
+                        ui.button(
+                            "Search",
+                            on_click=lambda: _search_action(
+                                sr_query.value or "",
+                                sr_trackers.value or "",
+                            ),
+                        )
+
+                    with ui.expansion("Daemon (background timer loop)"):
+                        node_address = ui.input(label="Node address (for `start` only)", placeholder="https://example/node")
+                        total_storage = ui.input(label="Total storage (bytes, for start)", placeholder="8388608")
+                        start_force = ui.checkbox(label="--force (allow start even if already initialized)")
+
+                        with ui.row():
+                            ui.button("Start load", on_click=_daemon_start_load)
+                            ui.button("Start signup (start)", on_click=_daemon_start_signup)
+                        ui.button("Stop daemon", color="negative", on_click=_daemon_stop)
+
+                # Right side: output log.
+                with ui.column().classes("w-2/5"):
+                    ui.label("Output log").classes("text-subtitle2 q-mb-sm")
+                    log
+
+        ui.label("Note: daemon + one-shot actions may run concurrently.").classes("text-caption")
+
+    def _parse_lines(raw: str) -> list[str]:
+        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    async def _download_action(torrent_id: str, trackers_raw: str) -> None:
+        d = data_dir.value or ""
+        if not d:
+            ui.notify("Enter node data directory.", color="negative")
+            return
+        tid = torrent_id.strip()
+        if not tid:
+            ui.notify("Enter torrent id / info-hash.", color="negative")
+            return
+        trackers = _parse_lines(trackers_raw)
+        argv = ["download", "-d", d, tid]
+        for tr in trackers:
+            argv += ["--tracker", tr]
+        await _run_cli(argv, banner="download ...")
+
+    async def _search_action(query: str, trackers_raw: str) -> None:
+        d = data_dir.value or ""
+        if not d:
+            ui.notify("Enter node data directory.", color="negative")
+            return
+        q = query.strip()
+        trackers = _parse_lines(trackers_raw)
+        argv = ["search", "-d", d, q]
+        for tr in trackers:
+            argv += ["--tracker", tr]
+        await _run_cli(argv, banner=f"search {q!r}")
+
+    # NiceGUI needs a synchronous entrypoint; all handlers are async-capable.
+    ui.run(title="Vertex GUI", dark=True)
+
+
+if __name__ == "__main__":
+    main()
+
+"""
 ``vertex-gui``: CustomTkinter front-end that delegates to :func:`CLI.app.main` and ``vertex-cli``.
 
 Quick actions (config / download / search) run in a worker thread by calling the same entry
@@ -18,9 +361,28 @@ from pathlib import Path
 
 from CLI.app import main as cli_main
 
+
+def _tk_missing_in_chain(err: BaseException | None) -> bool:
+    while err is not None:
+        if isinstance(err, ModuleNotFoundError) and err.name in ("_tkinter", "tkinter"):
+            return True
+        if "no module named '_tkinter'" in str(err).lower():
+            return True
+        err = err.__cause__ or err.__context__
+    return False
+
+
 try:
     import customtkinter as ctk  # type: ignore[import-untyped]
 except ImportError as e:  # pragma: no cover - import guard for optional dep
+    if _tk_missing_in_chain(e):
+        raise ImportError(
+            "The GUI needs Tcl/Tk support in your Python (the _tkinter extension). "
+            "pip install customtkinter is not enough on its own. On Debian/Ubuntu: "
+            "sudo apt install python3-tk. Fedora: sudo dnf install python3-tkinter. "
+            "Arch: sudo pacman -S tk. NixOS: use python3Full or add tkinter to your shell/env. "
+            "Then run again."
+        ) from e
     raise ImportError(
         "The GUI requires customtkinter. Install with: pip install vertex-client[gui]"
     ) from e
@@ -70,6 +432,10 @@ class VertexGuiApp(ctk.CTk):
         self._build_log()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Hyprland/Wayland sometimes leaves Tk windows without proper focus on open,
+        # which makes widgets ignore mouse clicks. This forces a raise/focus once.
+        self.after(50, self._fixup_focus)
 
     def _build_header(self) -> None:
         top = ctk.CTkFrame(self, fg_color="transparent")
@@ -314,6 +680,17 @@ class VertexGuiApp(ctk.CTk):
     def _on_close(self) -> None:
         self._daemon_stop()
         self.destroy()
+
+    def _fixup_focus(self) -> None:
+        try:
+            self.lift()
+            self.focus_force()
+            # Temporary topmost toggle can help some compositors deliver events.
+            self.attributes("-topmost", True)
+            self.attributes("-topmost", False)
+        except Exception:
+            # If the platform doesn't support the attribute, ignore and continue.
+            pass
 
 
 def main() -> None:

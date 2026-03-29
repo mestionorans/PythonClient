@@ -1,8 +1,11 @@
 """
-Desktop GUI for Vertex: wraps :mod:`CLI.app` (same behavior as ``vertex-cli``).
+Web GUI for Vertex (NiceGUI): wraps :mod:`CLI.app` (same behavior as ``vertex-cli``).
 
-Install with the ``gui`` extra: ``pip install vertex-client[gui]``, then run ``vertex-gui``
-or ``python -m GUI``.
+**Run (after install):** ``pip install ".[gui]"`` (or ``vertex-client[gui]`` from PyPI), then
+``vertex-gui`` or ``python -m GUI``.
+
+**Run from a git checkout without installing:** put ``src`` on ``PYTHONPATH``, or use the repo
+root ``run_gui.py`` launcher, or ``cd src && python -m GUI``.
 """
 
 from __future__ import annotations

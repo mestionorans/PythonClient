@@ -3,3 +3,6 @@
 # Or install deps only: pip install -r requirements.txt
 cryptography>=42.0.0
 pytest>=7.0
+
+# GUI (vertex-gui, python -m GUI, run_gui.py) — matches optional-dependencies gui in pyproject.toml.
+nicegui>=3.9.0

@@ -19,7 +19,7 @@ def get_config(node_address: str) -> dict[str, Any]:
     Expected real fields: ``Health_Ind_Storage_Perc``, ``Emergency_Storage_Perc``, ``Swappiness``,
     ``TrustQuickness``, ``Timer_Interval_Hours``, ``TrustedTracker`` (list; replaces
     ``TrustedTrackerList`` from the wire), ``Unhealth_Index``, ``Priority_Weights`` (object mapping
-    priority level to weight), ``Penalty_Limit`` (max penalties before a neighbor is banned).
+    priorit level to weight), ``Penalty_Limit`` (max penalties before a neighbor is banned).
     """
     del node_address
     return {

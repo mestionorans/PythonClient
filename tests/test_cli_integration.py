@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from vertex import VertexClient
 from vertex import db_setup
+from vertex.i2p import I2P
 
 from CLI.app import main
 
@@ -153,7 +155,19 @@ def test_cli_download_calls_i2p_download_file(
 
 
 @pytest.mark.integration
-def test_cli_search_calls_i2p_and_prints_sample_json(tmp_path: Path) -> None:
+def test_cli_search_calls_i2p_and_prints_sample_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_search(self: I2P, query: str, trackers: list[str]) -> dict[str, Any]:
+        return {
+            "deadbeefcafebabe0000deadbeefcafebabe0000": {
+                "name": "[test] sample",
+                "matched_query": query,
+                "trackers_filter": list(trackers),
+                "indexer": "nyaa.si",
+            }
+        }
+
+    monkeypatch.setattr(I2P, "search", fake_search)
+
     d = tmp_path / "s"
     c = VertexClient(d)
     c.close()
@@ -165,5 +179,5 @@ def test_cli_search_calls_i2p_and_prints_sample_json(tmp_path: Path) -> None:
         main(["search", "test-query", "-d", str(d)])
     out = buf.getvalue()
     assert "deadbeefcafebabe0000deadbeefcafebabe0000" in out
-    assert "stub" in out
+    assert "nyaa.si" in out
     assert "test-query" in out

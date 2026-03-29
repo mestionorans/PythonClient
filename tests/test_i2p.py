@@ -218,16 +218,60 @@ def test_count_seeders_unknown_id_no_rpc(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_search_stub_returns_sample_echoing_args(tmp_path):
+_SAMPLE_NYAA_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa" version="2.0">
+<channel>
+<item>
+<title>Example Release</title>
+<link>https://nyaa.si/download/1.torrent</link>
+<guid isPermaLink="true">https://nyaa.si/view/1</guid>
+<pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>
+<nyaa:infoHash>deadbeefcafebabe0000deadbeefcafebabe0000</nyaa:infoHash>
+<nyaa:seeders>5</nyaa:seeders>
+<nyaa:leechers>1</nyaa:leechers>
+<nyaa:downloads>10</nyaa:downloads>
+<nyaa:categoryId>1_2</nyaa:categoryId>
+<nyaa:category>Anime - English-translated</nyaa:category>
+<nyaa:size>1.0 GiB</nyaa:size>
+</item>
+</channel>
+</rss>
+"""
+
+
+def test_search_nyaa_parses_rss(monkeypatch, tmp_path):
+    class _Resp:
+        def read(self) -> bytes:
+            return _SAMPLE_NYAA_RSS
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a: object) -> None:
+            return None
+
+    monkeypatch.setattr("vertex.i2p.urllib.request.urlopen", lambda *a, **k: _Resp())
+
     client = I2P(tmp_path)
     out = client.search("my query", ["http://t/"])
     assert len(out) == 1
     hid = "deadbeefcafebabe0000deadbeefcafebabe0000"
     assert hid in out
     meta = out[hid]
-    assert meta["stub"] is True
+    assert meta["name"] == "Example Release"
+    assert meta["indexer"] == "nyaa.si"
     assert meta["matched_query"] == "my query"
     assert meta["trackers_filter"] == ["http://t/"]
+    assert meta["torrent_url"] == "https://nyaa.si/download/1.torrent"
+    assert meta["page_url"] == "https://nyaa.si/view/1"
+    assert meta["seeders"] == 5
+    assert meta["leechers"] == 1
+    assert meta["downloads"] == 10
+
+
+def test_search_empty_query_returns_empty_without_network(tmp_path):
+    client = I2P(tmp_path)
+    assert client.search("  \t", []) == {}
 
 
 @pytest.mark.parametrize(

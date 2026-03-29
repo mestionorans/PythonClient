@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -33,6 +34,56 @@ DEFAULT_BROADCAST_PORT = 28765
 
 _QBITTORRENT_USERNAME = "admin"
 _QBITTORRENT_PASSWORD = "adminpassword"
+
+_NYAA_XMLNS = "https://nyaa.si/xmlns/nyaa"
+
+
+def _nyaa_el_text(item: ET.Element, local: str) -> str:
+    el = item.find(f"{{{_NYAA_XMLNS}}}{local}")
+    if el is None or el.text is None:
+        return ""
+    return el.text.strip()
+
+
+def _nyaa_int(item: ET.Element, local: str) -> int:
+    t = _nyaa_el_text(item, local)
+    if not t:
+        return 0
+    try:
+        return int(t)
+    except ValueError:
+        return 0
+
+
+def _parse_nyaa_rss(xml: bytes, query: str, trackers: list[str]) -> dict[str, dict[str, Any]]:
+    """Parse a nyaa.si ``page=rss`` response into ``{info_hash: metadata}``."""
+    root = ET.fromstring(xml)
+    out: dict[str, dict[str, Any]] = {}
+    for item in root.findall(".//item"):
+        ih_raw = _nyaa_el_text(item, "infoHash")
+        if len(ih_raw) != 40 or not all(c in "0123456789abcdefABCDEF" for c in ih_raw):
+            continue
+        ih = ih_raw.lower()
+        title = (item.findtext("title") or "").strip()
+        tlink = (item.findtext("link") or "").strip()
+        guid = (item.findtext("guid") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        out[ih] = {
+            "name": title,
+            "torrent_url": tlink,
+            "page_url": guid,
+            "published": pub,
+            "seeders": _nyaa_int(item, "seeders"),
+            "leechers": _nyaa_int(item, "leechers"),
+            "downloads": _nyaa_int(item, "downloads"),
+            "size": _nyaa_el_text(item, "size"),
+            "category": _nyaa_el_text(item, "category"),
+            "category_id": _nyaa_el_text(item, "categoryId"),
+            "matched_query": query,
+            "trackers_filter": list(trackers),
+            "indexer": "nyaa.si",
+        }
+    return out
 
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -288,21 +339,33 @@ class I2P:
 
     def search(self, search_str: str, trackers: list[str]) -> dict[str, Any]:
         """
-        Search for torrents: **in** — ``search_str``, ``trackers``; **out** — ``{id: metadata}``.
+        Search nyaa.si via their RSS API: **in** — ``search_str``, ``trackers`` (echoed per result);
+        **out** — ``{info_hash: metadata}`` with ``name``, ``torrent_url``, ``page_url``, swarm
+        counts, ``indexer`` (``\"nyaa.si\"``), etc.
 
-        **Stub:** returns a fixed sample map (one entry) so UIs and :mod:`CLI` can be exercised;
-        echoes ``search_str`` and ``trackers`` in the metadata. Replace with real indexer /
-        network results when implemented.
+        ``trackers`` does not filter the indexer query; it is recorded for Vertex callers that pass
+        preferred announce URLs for later download.
         """
-        sample_id = "deadbeefcafebabe0000deadbeefcafebabe0000"
-        return {
-            sample_id: {
-                "name": "[stub] Sample torrent title",
-                "stub": True,
-                "matched_query": search_str,
-                "trackers_filter": list(trackers),
-            }
-        }
+        q = search_str.strip()
+        if not q:
+            return {}
+        qs = urllib.parse.urlencode({"f": "0", "c": "0_0", "q": q, "page": "rss"})
+        url = f"https://nyaa.si/?{qs}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "vertex-client/0.1"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"nyaa.si search failed: HTTP {e.code}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"nyaa.si search failed: {e.reason!r}") from e
+        try:
+            return _parse_nyaa_rss(raw, q, trackers)
+        except ET.ParseError as e:
+            raise RuntimeError(f"nyaa.si returned invalid RSS: {e}") from e
 
     def delete_torrent(self, file_path: str, id: str) -> None:
         """

@@ -10,22 +10,34 @@ delete and info calls—no separate “internal id” is used at the application
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Any
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-__all__ = ["I2P"]
+__all__ = ["I2P", "DEFAULT_BROADCAST_PORT"]
 
 _SEED_PREFIX = b"VERTEX_SEED\x00"
 
+# Local HTTP endpoint for :meth:`I2P.update_broadcast` (``/publickey``, ``/broadcast``).
+DEFAULT_BROADCAST_PORT = 28765
+
 _QBITTORRENT_USERNAME = "admin"
 _QBITTORRENT_PASSWORD = "adminpassword"
+
+
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class I2P:
@@ -48,6 +60,8 @@ class I2P:
         data_dir: Path | str,
         *,
         private_key: Ed25519PrivateKey | None = None,
+        broadcast_host: str = "127.0.0.1",
+        broadcast_port: int = DEFAULT_BROADCAST_PORT,
     ) -> None:
         self.data_dir: Path = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +75,12 @@ class I2P:
         self.identity: str = raw.hex()
         self._seed_signatures: dict[tuple[str, str], bytes] = {}
         self._rpc_session_id: str | None = None
+        self._broadcast_host = broadcast_host
+        self._broadcast_port = broadcast_port
+        self._broadcast_lock = threading.Lock()
+        self._broadcast_publickey_text = ""
+        self._broadcast_body = b"{}"
+        self._broadcast_server: _ThreadingHTTPServer | None = None
 
     def _rpc_url(self) -> str:
         return f"http://{self.RPC_IP}/api/v2"
@@ -308,17 +328,31 @@ class I2P:
         return {}
 
     def update_broadcast(self, message: str) -> None:
-        """Updates the broadcast to whatever message is provided."""
-        docroot = Path.home() / ".i2p" / "eepsite" / "docroot"
-        docroot.mkdir(parents=True, exist_ok=True)
-
-        publickey_path = docroot / "publickey"
-        publickey_path.write_text(self.identity)
-
+        """
+        Sign ``message`` and serve the same payloads as the former ``~/.i2p/eepsite/docroot`` files:
+        ``GET /publickey`` (plaintext identity) and ``GET /broadcast`` (signed JSON).
+        """
         signature = self._sk.sign(message.encode())
-        broadcast_path = docroot / "broadcast"
-        content = json.dumps({"message": message, "signature": signature.hex()})
-        broadcast_path.write_text(content)
+        body = json.dumps({"message": message, "signature": signature.hex()}).encode()
+        with self._broadcast_lock:
+            self._broadcast_publickey_text = self.identity
+            self._broadcast_body = body
+            if self._broadcast_server is None:
+                handler = _broadcast_handler_factory(self)
+                srv = _ThreadingHTTPServer((self._broadcast_host, self._broadcast_port), handler)
+                self._broadcast_server = srv
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    @property
+    def broadcast_base_url(self) -> str:
+        """``http://host:port`` for the broadcast HTTP server (after :meth:`update_broadcast`)."""
+        if self._broadcast_server is None:
+            raise RuntimeError("Broadcast server not running; call update_broadcast first.")
+        host, port = self._broadcast_server.server_address
+        host_s = str(host)
+        if ":" in host_s and not host_s.startswith("["):
+            host_s = f"[{host_s}]"
+        return f"http://{host_s}:{port}"
 
     def count_seeders(self, id: str, _requesting_seeder: str | None = None) -> int:
         """
@@ -336,3 +370,32 @@ class I2P:
             if t.get("hash", "").lower() == torrent_hash:
                 return int(t.get("num_seeds", 0))
         return 0
+
+
+def _broadcast_handler_factory(i2p: I2P) -> type[BaseHTTPRequestHandler]:
+    class BroadcastHTTPRequestHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            path = path.rstrip("/") or "/"
+            with i2p._broadcast_lock:
+                publickey = i2p._broadcast_publickey_text
+                broadcast = i2p._broadcast_body
+            if path == "/publickey":
+                raw = publickey.encode()
+                ctype = "text/plain; charset=utf-8"
+            elif path == "/broadcast":
+                raw = broadcast
+                ctype = "application/json; charset=utf-8"
+            else:
+                self.send_error(404, "Not Found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, _format: str, *_args: Any) -> None:
+            return
+
+    return BroadcastHTTPRequestHandler

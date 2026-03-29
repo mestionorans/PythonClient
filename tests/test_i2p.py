@@ -1,9 +1,11 @@
 import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
 
-from vertex.i2p import I2P
+from vertex.i2p import DEFAULT_BROADCAST_PORT, I2P
 
 _INFO_HASH = "f83c9c934fe967ded372a5da535d11e56d3807f2"
 
@@ -258,30 +260,44 @@ def test_parse_rpc_response_unknown_text_raises(tmp_path):
         client._parse_rpc_response("<html>not json</html>")
 
 
-def test_update_broadcast_writes_signed_json(monkeypatch, tmp_path):
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+def test_i2p_default_broadcast_port(tmp_path):
+    assert I2P(tmp_path)._broadcast_port == DEFAULT_BROADCAST_PORT
 
-    client = I2P(tmp_path)
+
+def test_update_broadcast_serves_signed_json_over_http(tmp_path):
+    client = I2P(tmp_path, broadcast_port=0)
     client.update_broadcast("hello world")
-
-    broadcast_file = tmp_path / ".i2p" / "eepsite" / "docroot" / "broadcast"
-    content = json.loads(broadcast_file.read_text())
+    base = client.broadcast_base_url
+    with urllib.request.urlopen(f"{base}/broadcast", timeout=5) as resp:
+        content = json.loads(resp.read().decode())
     assert content["message"] == "hello world"
     assert len(content["signature"]) == 128
 
-    publickey_file = tmp_path / ".i2p" / "eepsite" / "docroot" / "publickey"
-    assert publickey_file.read_text() == client.identity
+    with urllib.request.urlopen(f"{base}/publickey", timeout=5) as resp:
+        assert resp.read().decode() == client.identity
 
 
-def test_update_broadcast_creates_parent_dirs(monkeypatch, tmp_path):
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+def test_update_broadcast_second_call_updates_http_payload(tmp_path):
+    client = I2P(tmp_path, broadcast_port=0)
+    client.update_broadcast("first")
+    base = client.broadcast_base_url
+    with urllib.request.urlopen(f"{base}/broadcast", timeout=5) as resp:
+        assert json.loads(resp.read().decode())["message"] == "first"
+    client.update_broadcast("second")
+    with urllib.request.urlopen(f"{base}/broadcast", timeout=5) as resp:
+        assert json.loads(resp.read().decode())["message"] == "second"
 
+
+def test_update_broadcast_unknown_path_404(tmp_path):
+    client = I2P(tmp_path, broadcast_port=0)
+    client.update_broadcast("x")
+    req = urllib.request.Request(f"{client.broadcast_base_url}/nope")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc_info.value.code == 404
+
+
+def test_broadcast_base_url_before_start_raises(tmp_path):
     client = I2P(tmp_path)
-    client.update_broadcast("test message")
-
-    broadcast_path = tmp_path / ".i2p" / "eepsite" / "docroot" / "broadcast"
-    content = json.loads(broadcast_path.read_text())
-    assert content["message"] == "test message"
-
-    publickey_path = tmp_path / ".i2p" / "eepsite" / "docroot" / "publickey"
-    assert publickey_path.read_text() == client.identity
+    with pytest.raises(RuntimeError, match="update_broadcast"):
+        _ = client.broadcast_base_url

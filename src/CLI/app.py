@@ -254,7 +254,7 @@ def _run_search(client: VertexClient, query: str, trackers: list[str]) -> None:
         query,
         trackers if trackers else "(any)",
     )
-    _LOG.info("Calling I2P.search (nyaa.si RSS).")
+    _LOG.info("Calling I2P.search (bitmagnet Torznab API).")
     result = client._i2p.search(query, trackers)
     _LOG.info("Search returned %d entr(y/ies).", len(result))
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -478,7 +478,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser(
         "search",
-        help="Search nyaa.si via I2P (RSS).",
+        help="Search local bitmagnet via I2P (Torznab API).",
     )
     p_search.add_argument(
         "-d",
@@ -491,7 +491,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "query",
         nargs="?",
         default="",
-        help="Search string for I2P.search (nyaa.si query).",
+        help="Search string for I2P.search (bitmagnet query).",
     )
     p_search.add_argument(
         "--tracker",

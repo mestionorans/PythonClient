@@ -218,31 +218,32 @@ def test_count_seeders_unknown_id_no_rpc(monkeypatch, tmp_path):
     assert calls == []
 
 
-_SAMPLE_NYAA_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
-<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa" version="2.0">
+_SAMPLE_BITMAGNET_TORZNAB_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:torznab="http://torznab.com/schemas/2015/feed" version="2.0">
 <channel>
 <item>
 <title>Example Release</title>
-<link>https://nyaa.si/download/1.torrent</link>
-<guid isPermaLink="true">https://nyaa.si/view/1</guid>
+<link>https://index.example/view/1</link>
+<guid isPermaLink="true">https://index.example/view/1</guid>
 <pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>
-<nyaa:infoHash>deadbeefcafebabe0000deadbeefcafebabe0000</nyaa:infoHash>
-<nyaa:seeders>5</nyaa:seeders>
-<nyaa:leechers>1</nyaa:leechers>
-<nyaa:downloads>10</nyaa:downloads>
-<nyaa:categoryId>1_2</nyaa:categoryId>
-<nyaa:category>Anime - English-translated</nyaa:category>
-<nyaa:size>1.0 GiB</nyaa:size>
+<torznab:attr name="infohash" value="deadbeefcafebabe0000deadbeefcafebabe0000"/>
+<torznab:attr name="seeders" value="5"/>
+<torznab:attr name="peers" value="1"/>
+<torznab:attr name="grabs" value="10"/>
+<torznab:attr name="categoryid" value="1_2"/>
+<torznab:attr name="category" value="Anime - English-translated"/>
+<torznab:attr name="size" value="1.0 GiB"/>
+<torznab:attr name="magneturl" value="magnet:?xt=urn:btih:deadbeefcafebabe0000deadbeefcafebabe0000&amp;dn=Example%20Release"/>
 </item>
 </channel>
 </rss>
 """
 
 
-def test_search_nyaa_parses_rss(monkeypatch, tmp_path):
+def test_search_bitmagnet_parses_torznab_rss(monkeypatch, tmp_path):
     class _Resp:
         def read(self) -> bytes:
-            return _SAMPLE_NYAA_RSS
+            return _SAMPLE_BITMAGNET_TORZNAB_RSS
 
         def __enter__(self):
             return self
@@ -259,11 +260,11 @@ def test_search_nyaa_parses_rss(monkeypatch, tmp_path):
     assert hid in out
     meta = out[hid]
     assert meta["name"] == "Example Release"
-    assert meta["indexer"] == "nyaa.si"
+    assert meta["indexer"] == "bitmagnet"
     assert meta["matched_query"] == "my query"
     assert meta["trackers_filter"] == ["http://t/"]
-    assert meta["torrent_url"] == "https://nyaa.si/download/1.torrent"
-    assert meta["page_url"] == "https://nyaa.si/view/1"
+    assert meta["torrent_url"].startswith("magnet:?xt=urn:btih:deadbeef")
+    assert meta["page_url"] == "https://index.example/view/1"
     assert meta["seeders"] == 5
     assert meta["leechers"] == 1
     assert meta["downloads"] == 10

@@ -36,24 +36,46 @@ DEFAULT_BROADCAST_PORT = 28765
 _QBITTORRENT_USERNAME = "admin"
 _QBITTORRENT_PASSWORD = "adminpassword"
 
-_NYAA_XMLNS = "https://nyaa.si/xmlns/nyaa"
+_BITMAGNET_BASE_URL = "http://127.0.0.1:3333"
+_TORZNAB_XMLNS = "http://torznab.com/schemas/2015/feed"
 
 
-def _nyaa_el_text(item: ET.Element, local: str) -> str:
-    el = item.find(f"{{{_NYAA_XMLNS}}}{local}")
+def _el_text(item: ET.Element, local: str, *, namespace: str = _TORZNAB_XMLNS) -> str:
+    el = item.find(f"{{{namespace}}}{local}")
     if el is None or el.text is None:
         return ""
     return el.text.strip()
 
 
-def _nyaa_int(item: ET.Element, local: str) -> int:
-    t = _nyaa_el_text(item, local)
+def _el_int(item: ET.Element, local: str, *, namespace: str = _TORZNAB_XMLNS) -> int:
+    t = _el_text(item, local, namespace=namespace)
     if not t:
         return 0
     try:
         return int(t)
     except ValueError:
         return 0
+
+
+def _torznab_attr(item: ET.Element, attr_name: str) -> str:
+    for attr in item.findall(f".//{{{_TORZNAB_XMLNS}}}attr"):
+        if str(attr.get("name", "")).strip().lower() == attr_name.lower():
+            return str(attr.get("value", "")).strip()
+    return ""
+
+
+def _info_hash_from_magnet_uri(uri: str) -> str:
+    parsed = urllib.parse.urlparse(uri.strip())
+    if parsed.scheme.lower() != "magnet":
+        return ""
+    qs = urllib.parse.parse_qs(parsed.query)
+    for xt in qs.get("xt", []):
+        s = str(xt).strip()
+        if s.lower().startswith("urn:btih:"):
+            h = s[9:].strip()
+            if len(h) == 40 and all(c in "0123456789abcdefABCDEF" for c in h):
+                return h.lower()
+    return ""
 
 
 def _peer_ip_to_broadcast_base_url(ip: str, port: int = DEFAULT_BROADCAST_PORT) -> str:
@@ -79,33 +101,50 @@ def _is_ed25519_public_key_hex(s: str) -> bool:
     return all(c in "0123456789abcdefABCDEF" for c in t)
 
 
-def _parse_nyaa_rss(xml: bytes, query: str, trackers: list[str]) -> dict[str, dict[str, Any]]:
-    """Parse a nyaa.si ``page=rss`` response into ``{info_hash: metadata}``."""
+def _parse_torznab_rss(xml: bytes, query: str, trackers: list[str]) -> dict[str, dict[str, Any]]:
+    """Parse a Torznab RSS response into ``{info_hash: metadata}``."""
     root = ET.fromstring(xml)
     out: dict[str, dict[str, Any]] = {}
     for item in root.findall(".//item"):
-        ih_raw = _nyaa_el_text(item, "infoHash")
+        ih_raw = _torznab_attr(item, "infohash")
+        if not ih_raw:
+            ih_raw = _info_hash_from_magnet_uri(_torznab_attr(item, "magneturl"))
+        if not ih_raw:
+            ih_raw = _info_hash_from_magnet_uri((item.findtext("guid") or "").strip())
+        if not ih_raw:
+            ih_raw = _info_hash_from_magnet_uri((item.findtext("link") or "").strip())
         if len(ih_raw) != 40 or not all(c in "0123456789abcdefABCDEF" for c in ih_raw):
             continue
         ih = ih_raw.lower()
         title = (item.findtext("title") or "").strip()
-        tlink = (item.findtext("link") or "").strip()
+        magnet_url = _torznab_attr(item, "magneturl")
+        tlink = magnet_url or (item.findtext("link") or "").strip()
         guid = (item.findtext("guid") or "").strip()
         pub = (item.findtext("pubDate") or "").strip()
+        category = _torznab_attr(item, "category")
+        category_id = _torznab_attr(item, "categoryid")
+        seeders = _torznab_attr(item, "seeders")
+        leechers = _torznab_attr(item, "peers")
+        if not leechers:
+            leechers = _torznab_attr(item, "leechers")
+        downloads = _torznab_attr(item, "grabs")
+        size = _torznab_attr(item, "size")
+        if not size:
+            size = _torznab_attr(item, "filesize")
         out[ih] = {
             "name": title,
             "torrent_url": tlink,
             "page_url": guid,
             "published": pub,
-            "seeders": _nyaa_int(item, "seeders"),
-            "leechers": _nyaa_int(item, "leechers"),
-            "downloads": _nyaa_int(item, "downloads"),
-            "size": _nyaa_el_text(item, "size"),
-            "category": _nyaa_el_text(item, "category"),
-            "category_id": _nyaa_el_text(item, "categoryId"),
+            "seeders": int(seeders) if seeders.isdigit() else _el_int(item, "seeders"),
+            "leechers": int(leechers) if leechers.isdigit() else _el_int(item, "peers"),
+            "downloads": int(downloads) if downloads.isdigit() else _el_int(item, "grabs"),
+            "size": size,
+            "category": category,
+            "category_id": category_id,
             "matched_query": query,
             "trackers_filter": list(trackers),
-            "indexer": "nyaa.si",
+            "indexer": "bitmagnet",
         }
     return out
 
@@ -390,18 +429,18 @@ class I2P:
 
     def search(self, search_str: str, trackers: list[str]) -> dict[str, Any]:
         """
-        Search nyaa.si via their RSS API: **in** — ``search_str``, ``trackers`` (echoed per result);
-        **out** — ``{info_hash: metadata}`` with ``name``, ``torrent_url``, ``page_url``, swarm
-        counts, ``indexer`` (``\"nyaa.si\"``), etc.
+        Search a local bitmagnet indexer via Torznab API: **in** — ``search_str``, ``trackers``
+        (echoed per result); **out** — ``{info_hash: metadata}`` with ``name``, ``torrent_url``,
+        ``page_url``, swarm counts, ``indexer`` (``\"bitmagnet\"``), etc.
 
-        ``trackers`` does not filter the indexer query; it is recorded for Vertex callers that pass
-        preferred announce URLs for later download.
+        ``trackers`` does not filter the bitmagnet query; it is recorded for Vertex callers that
+        pass preferred announce URLs for later download.
         """
         q = search_str.strip()
         if not q:
             return {}
-        qs = urllib.parse.urlencode({"f": "0", "c": "0_0", "q": q, "page": "rss"})
-        url = f"https://nyaa.si/?{qs}"
+        qs = urllib.parse.urlencode({"t": "search", "q": q})
+        url = f"{_BITMAGNET_BASE_URL}/torznab/api?{qs}"
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "vertex-client/0.1"},
@@ -410,13 +449,13 @@ class I2P:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"nyaa.si search failed: HTTP {e.code}") from e
+            raise RuntimeError(f"bitmagnet search failed: HTTP {e.code}") from e
         except urllib.error.URLError as e:
-            raise RuntimeError(f"nyaa.si search failed: {e.reason!r}") from e
+            raise RuntimeError(f"bitmagnet search failed: {e.reason!r}") from e
         try:
-            return _parse_nyaa_rss(raw, q, trackers)
+            return _parse_torznab_rss(raw, q, trackers)
         except ET.ParseError as e:
-            raise RuntimeError(f"nyaa.si returned invalid RSS: {e}") from e
+            raise RuntimeError(f"bitmagnet returned invalid RSS: {e}") from e
 
     def delete_torrent(self, file_path: str, id: str) -> None:
         """
